@@ -1,0 +1,4 @@
+requests>=2.31.0
+pyyaml>=6.0
+rich>=13.0.0
+plyer>=2.1.0

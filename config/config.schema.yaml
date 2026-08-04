@@ -1,0 +1,40 @@
+# ============================
+# 配置说明（与 config.yaml.template 对应）
+# 首次使用建议直接运行 setup.bat / setup.py 自动生成 config.yaml
+# ============================
+
+auth:
+  # 你的学号（南邮统一身份认证账号），用于预约签名
+  student_id: "B21000000"
+  # 预留字段（当前预约系统走微信登录，未使用）
+  password: ""
+  cas_mode: "wecom"
+
+api:
+  # 小程序后端地址
+  base_url: "https://wechat.njupt.edu.cn/mini_program/v4"
+  timeout_seconds: 30
+
+token_capture:
+  # 自动抓包刷新 token 配置
+  enabled: true              # book.py 在 token 过期时自动短时抓包
+  timeout_seconds: 300       # 独立刷新等待秒数
+  fallback_timeout_seconds: 60   # book.py 内兜底抓包等待秒数
+  mitm_port: 8080            # 抓包代理端口
+  mode: pc_wechat            # pc_wechat（电脑微信）| phone（手机+Shadowrocket）
+  refresh_time: "11:30"      # 每日刷新计划任务时间
+
+booking:
+  # 要抢的场次（按优先级从高到低）
+  # court_name 需与小程序里的场地名称一致；time 格式 "HH:MM-HH:MM"
+  targets:
+    - court_name: "仙林体育馆主馆1F羽毛球1号场地"
+      time: "16:00-17:00"
+  # 提前可预约天数
+  book_ahead_days: 7
+  # 每天开放抢购时间
+  schedule_time: "12:00"
+
+notify:
+  enable_desktop: true
+  enable_console: true
