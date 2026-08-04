@@ -10,7 +10,7 @@
 """
 
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -47,14 +47,11 @@ def render_config(cfg):
     L.append("booking:")
     L.append('  # 预约地点: "仙林" / "三牌楼" / 空（不限）')
     L.append(f'  location: "{cfg.get("booking", {}).get("location", "仙林")}"')
-    L.append('  # 预约日期（空=默认抢今天+book_ahead_days 的场次；用 configure.py 会填上）')
-    L.append(f'  target_date: "{cfg.get("booking", {}).get("target_date", "")}"')
-    L.append('  # 要抢的场次（按优先级从高到低）')
+    L.append('  # 要抢的场次（按优先级从高到低；预约日期固定为当天）')
     L.append("  targets:")
     for t in cfg.get("booking", {}).get("targets", []):
         L.append(f'    - court_name: "{t.get("court_name", "")}"')
         L.append(f'      time: "{t.get("time", "")}"')
-    L.append(f'  book_ahead_days: {cfg.get("booking", {}).get("book_ahead_days", 7)}')
     L.append(f'  schedule_time: "{cfg.get("booking", {}).get("schedule_time", "12:00")}"')
     L.append("")
     L.append("token_capture:")
@@ -110,7 +107,7 @@ def pick_location(cfg):
 
 
 def show_court_table(slots, location, only_available=True):
-    """展示场地表格（id → 场地名 → 时间段 → 状态）。"""
+    """按时间段分组展示场地（序号 | 场地名 | 时间段），返回可按序号选择的列表。"""
     # 按地点过滤
     filtered = []
     for sid, name, start, end, status, date in slots:
@@ -124,17 +121,45 @@ def show_court_table(slots, location, only_available=True):
         console.print(f"[yellow]所选地点「{location or '不限'}」当天没有可用场次[/yellow]")
         return []
 
-    table = Table(title=f"可选场次（{location or '不限地点'}，{only_available and '仅可用' or '全部'}）")
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("场地ID", style="cyan")
-    table.add_column("场地名", style="bold")
-    table.add_column("时间段", style="green")
-    table.add_column("状态", justify="center")
-    for i, (sid, name, start, end, status, _date) in enumerate(filtered, 1):
-        table.add_row(str(i), str(sid), name, f"{start}-{end}",
-                      "[green]可用[/green]" if status else "[red]已满[/red]")
-    console.print(table)
-    return filtered
+    # 按时间段分组（如 16:00-17:00 / 17:00-18:00 ...）
+    groups = {}
+    for entry in filtered:
+        sid, name, start, end, status, date = entry
+        groups.setdefault(f"{start}-{end}", []).append(entry)
+
+    ordered = []
+    for period in sorted(groups):
+        table = Table(title=f"【{period}】", show_lines=True)
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("场地名", style="bold")
+        table.add_column("时间段", style="green")
+        for entry in groups[period]:
+            ordered.append(entry)
+            sid, name, start, end, status, date = entry
+            table.add_row(str(len(ordered)), name, f"{start}-{end}")
+        console.print(table)
+    return ordered
+
+
+def parse_picks(picks, filtered):
+    """解析序号输入（支持中文逗号），按「场地+时间段」去重，返回 (目标列表, 重复数)。"""
+    new_targets = []
+    seen = set()
+    dup_count = 0
+    for p in picks.replace("，", ",").split(","):
+        p = p.strip()
+        if not p.isdigit():
+            continue
+        idx = int(p) - 1
+        if 0 <= idx < len(filtered):
+            _sid, name, start, end, _status, _date = filtered[idx]
+            key = (name, f"{start}-{end}")
+            if key in seen:
+                dup_count += 1
+                continue
+            seen.add(key)
+            new_targets.append({"court_name": name, "time": f"{start}-{end}"})
+    return new_targets, dup_count
 
 
 def update_basic_info(cfg):
@@ -161,26 +186,9 @@ def main():
         console.print("[red]无法获取运动类型。token 可能已失效，请重新运行 capture_token.py --refresh[/red]")
         return 1
 
-    # 选择查询日期（--slots 模式直接用默认日期，不交互）
-    today = datetime.now().date()
-    book_ahead = cfg.get("booking", {}).get("book_ahead_days", 7)
-    default_date = (today + timedelta(days=book_ahead)).strftime("%Y-%m-%d")
-    if is_slots_only:
-        date = default_date
-        console.print(f"[dim]默认查询日期: {default_date}（今天 + {book_ahead} 天）[/dim]")
-    else:
-        console.print(f"\n[bold]选择要预约的日期:[/bold]")
-        console.print(f"  1) 今天 ({today.strftime('%Y-%m-%d')})")
-        console.print(f"  2) {book_ahead} 天后（可预约日, 默认）({default_date})")
-        console.print(f"  3) 自定义（输入 YYYY-MM-DD）")
-        choice = console.input(f"[cyan]选择[/cyan] (默认 2): ").strip()
-        if choice == "1":
-            date = today.strftime("%Y-%m-%d")
-        elif choice == "3":
-            date = ask("输入日期 (YYYY-MM-DD)", default_date)
-        else:
-            date = default_date
-    console.print(f"[green]将查询日期 {date} 的场次[/green]")
+    # 预约日期固定为当天
+    date = datetime.now().strftime("%Y-%m-%d")
+    console.print(f"[green]将查询今天 ({date}) 的场次[/green]")
     slots = query_slots(token, date, type_id)
 
     # 选择地点
@@ -200,21 +208,14 @@ def main():
         new_targets = []
         console.print("[yellow]已清空预约目标[/yellow]")
     else:
-        new_targets = []
-        for p in picks.replace("，", ",").split(","):
-            p = p.strip()
-            if not p.isdigit():
-                continue
-            idx = int(p) - 1
-            if 0 <= idx < len(filtered):
-                sid, name, start, end, _status, _date = filtered[idx]
-                new_targets.append({"court_name": name, "time": f"{start}-{end}"})
+        new_targets, dup_count = parse_picks(picks, filtered)
+        if dup_count:
+            console.print(f"[yellow]已忽略 {dup_count} 个重复场次[/yellow]")
         if not new_targets:
             console.print("[yellow]未识别到有效选择[/yellow]")
 
     # 写回配置
     cfg.setdefault("booking", {})["location"] = location
-    cfg["booking"]["target_date"] = date
     cfg["booking"]["targets"] = new_targets
     save_config(cfg)
 

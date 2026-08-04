@@ -26,9 +26,7 @@ token_capture:
 booking:
   # 预约地点: "仙林" / "三牌楼" / 空（不限）。留空则全部场地都抢
   location: "仙林"
-  # 预约日期（空=默认抢今天+book_ahead_days 的场次；用 configure.py 会填上）
-  target_date: ""
-  # 要抢的场次（按优先级从高到低）
+  # 要抢的场次（按优先级从高到低；预约日期固定为当天）
   targets:
     - court_name: "仙林体育馆主馆1F羽毛球1号场地"
       time: "16:00-17:00"
@@ -42,7 +40,6 @@ booking:
       time: "17:00-18:00"
     - court_name: "仙林体育馆3F羽毛球馆2号场地"
       time: "17:00-18:00"
-  book_ahead_days: 7
   schedule_time: "12:00"
 
 notify:
