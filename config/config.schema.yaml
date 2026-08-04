@@ -25,6 +25,8 @@ token_capture:
   refresh_time: "11:30"      # 每日刷新计划任务时间
 
 booking:
+  # 预约地点: "仙林" / "三牌楼" / 空（不限）
+  location: "仙林"
   # 要抢的场次（按优先级从高到低）
   # court_name 需与小程序里的场地名称一致；time 格式 "HH:MM-HH:MM"
   targets:

@@ -42,6 +42,8 @@ book.py 用 token 调用预约接口，12:00 精确抢购
 ## 每日使用
 
 ```bash
+python configure.py                # 配置向导：表格选场地/地点/时间（推荐）
+python configure.py --slots        # 只看某天场地表格，不改配置
 python capture_token.py --check    # 环境诊断
 python capture_token.py --wait 300 # 手动刷新 token（打开小程序自动捕获）
 python book.py --slots             # 查看可约场次（只读）
@@ -55,6 +57,8 @@ python book.py                     # 抢票（自动等到 12:00）
 
 | 命令 | 作用 |
 |---|---|
+| `python configure.py` | 配置向导（选场地/地点/时间） |
+| `python configure.py --slots` | 查看场地表格（不改配置） |
 | `python capture_token.py --check` | 环境诊断 |
 | `python capture_token.py --refresh` | 强制刷新 token |
 | `python capture_token.py --install-cert` | 重装 mitmproxy 证书 |
@@ -68,6 +72,7 @@ python book.py                     # 抢票（自动等到 12:00）
 ├── token_util.py              # JWT 读取/校验/保存（共享模块）
 ├── token_capture_addon.py     # mitmproxy 插件：提取 token
 ├── capture_token.py           # token 自动抓取/刷新 CLI
+├── configure.py               # 配置向导（表格选场地/地点/时间）
 ├── setup.py / setup.bat       # 一键配置向导
 ├── config/
 │   ├── config.yaml.template   # 配置模板
