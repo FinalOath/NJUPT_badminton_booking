@@ -32,8 +32,45 @@ def load_config():
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def render_config(cfg):
+    """把配置渲染成带注释的干净 YAML（只保留脚本用到的字段）。"""
+    L = []
+    L.append("# ============================")
+    L.append("# 羽毛球预约脚本配置")
+    L.append("# 由 configure.py 维护；也可手动编辑")
+    L.append("# ============================")
+    L.append("")
+    L.append("auth:")
+    L.append(f'  student_id: "{cfg.get("auth", {}).get("student_id", "")}"')
+    L.append('  cas_mode: "wecom"')
+    L.append("")
+    L.append("booking:")
+    L.append('  # 预约地点: "仙林" / "三牌楼" / 空（不限）')
+    L.append(f'  location: "{cfg.get("booking", {}).get("location", "仙林")}"')
+    L.append('  # 预约日期（空=默认抢今天+book_ahead_days 的场次；用 configure.py 会填上）')
+    L.append(f'  target_date: "{cfg.get("booking", {}).get("target_date", "")}"')
+    L.append('  # 要抢的场次（按优先级从高到低）')
+    L.append("  targets:")
+    for t in cfg.get("booking", {}).get("targets", []):
+        L.append(f'    - court_name: "{t.get("court_name", "")}"')
+        L.append(f'      time: "{t.get("time", "")}"')
+    L.append(f'  book_ahead_days: {cfg.get("booking", {}).get("book_ahead_days", 7)}')
+    L.append(f'  schedule_time: "{cfg.get("booking", {}).get("schedule_time", "12:00")}"')
+    L.append("")
+    L.append("token_capture:")
+    tc = cfg.get("token_capture", {})
+    L.append(f'  enabled: {tc.get("enabled", True)}')
+    L.append(f'  timeout_seconds: {tc.get("timeout_seconds", 300)}')
+    L.append(f'  fallback_timeout_seconds: {tc.get("fallback_timeout_seconds", 60)}')
+    L.append(f'  mitm_port: {tc.get("mitm_port", 8080)}')
+    L.append(f'  mode: "{tc.get("mode", "pc_wechat")}"')
+    L.append(f'  refresh_time: "{tc.get("refresh_time", "11:30")}"')
+    L.append("")
+    return "\n".join(L)
+
+
 def save_config(cfg):
-    CONFIG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    CONFIG_PATH.write_text(render_config(cfg), encoding="utf-8")
     console.print(f"[green]配置已保存到 {CONFIG_PATH}[/green]")
 
 
@@ -125,8 +162,25 @@ def main():
         return 1
 
     # 选择查询日期（--slots 模式直接用默认日期，不交互）
-    default_date = (datetime.now() + timedelta(days=cfg.get("booking", {}).get("book_ahead_days", 7))).strftime("%Y-%m-%d")
-    date = default_date if is_slots_only else ask(f"查询哪天的场次", default_date)
+    today = datetime.now().date()
+    book_ahead = cfg.get("booking", {}).get("book_ahead_days", 7)
+    default_date = (today + timedelta(days=book_ahead)).strftime("%Y-%m-%d")
+    if is_slots_only:
+        date = default_date
+        console.print(f"[dim]默认查询日期: {default_date}（今天 + {book_ahead} 天）[/dim]")
+    else:
+        console.print(f"\n[bold]选择要预约的日期:[/bold]")
+        console.print(f"  1) 今天 ({today.strftime('%Y-%m-%d')})")
+        console.print(f"  2) {book_ahead} 天后（可预约日, 默认）({default_date})")
+        console.print(f"  3) 自定义（输入 YYYY-MM-DD）")
+        choice = console.input(f"[cyan]选择[/cyan] (默认 2): ").strip()
+        if choice == "1":
+            date = today.strftime("%Y-%m-%d")
+        elif choice == "3":
+            date = ask("输入日期 (YYYY-MM-DD)", default_date)
+        else:
+            date = default_date
+    console.print(f"[green]将查询日期 {date} 的场次[/green]")
     slots = query_slots(token, date, type_id)
 
     # 选择地点
@@ -160,6 +214,7 @@ def main():
 
     # 写回配置
     cfg.setdefault("booking", {})["location"] = location
+    cfg["booking"]["target_date"] = date
     cfg["booking"]["targets"] = new_targets
     save_config(cfg)
 
