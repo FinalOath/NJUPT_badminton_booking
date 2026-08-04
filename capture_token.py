@@ -373,7 +373,12 @@ def main(argv=None):
         cfg = {**cfg, "token_capture": tc}
     timeout = args.wait if args.wait is not None else tc.get("timeout_seconds", 300)
     force = args.force or args.refresh
-    return run_refresh(cfg, timeout, force=force)
+    try:
+        return run_refresh(cfg, timeout, force=force)
+    except Exception as e:
+        print(f"[-] 无法刷新 token: {e}")
+        print("    请确认已安装 mitmproxy，或参考 README 手动抓取 token")
+        return 1
 
 
 if __name__ == "__main__":
