@@ -32,9 +32,7 @@ booking:
   targets:
     - court_name: "仙林体育馆主馆1F羽毛球1号场地"
       time: "16:00-17:00"
-  # 提前可预约天数
-  book_ahead_days: 7
-  # 每天开放抢购时间
+  # 每天开放抢购时间（预约日期固定为当天）
   schedule_time: "12:00"
 
 notify:
