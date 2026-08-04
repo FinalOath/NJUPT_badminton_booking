@@ -258,12 +258,13 @@ def main():
     is_now = "--now" in args
     is_slots = "--slots" in args
 
-    # 计算目标日期
+    # 计算目标日期：--date 参数 > 配置 target_date > 默认 today+N
     if "--date" in args:
         idx = sys.argv.index("--date") + 1
         target_date = sys.argv[idx] if idx < len(sys.argv) else ""
     else:
-        target_date = (datetime.now() + timedelta(days=book_ahead)).strftime("%Y-%m-%d")
+        target_date = cfg.get("booking", {}).get("target_date") or \
+            (datetime.now() + timedelta(days=book_ahead)).strftime("%Y-%m-%d")
 
     h, m = map(int, schedule_time.split(":"))
 
