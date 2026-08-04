@@ -1,0 +1,42 @@
+# ============ 敏感数据（禁止上传）============
+# 个人配置（含学号）
+config/config.yaml
+# 运行时数据（含 JWT token、appid）
+data/
+!data/.gitkeep
+# token 历史快照
+.history/
+
+# ============ 构建产物 ============
+# 分发包（含内置 mitmproxy，用 GitHub Release 上传）
+dist-*/
+dist-*.zip
+dist/
+*.zip
+
+# ============ 日志 ============
+logs/
+!logs/.gitkeep
+
+# ============ 本地工具/环境 ============
+# Claude Code 本地设置（含本机路径）
+.claude/
+# 空目录遗留
+.github/modernize/
+backup/
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============ 前端/Node ============
+node_modules/
+
+# ============ IDE/OS ============
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
