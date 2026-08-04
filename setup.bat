@@ -1,35 +1,38 @@
 @echo off
 REM ========================================
-REM 一键配置向导入口
-REM 用法: 双击 setup.bat 或在命令行运行
+REM Setup wizard entry
+REM Usage: double-click setup.bat or run in cmd
+REM Chinese messages are printed by setup.py (encoding-safe)
 REM ========================================
 cd /d "%~dp0"
 
-REM 检查 Python
+REM --- Check Python ---
 where python >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Python not found. Please install Python 3.10+ from https://www.python.org/downloads/
+    echo [ERROR] Python not found. Please install Python 3.10+ from:
+    echo         https://www.python.org/downloads/
     echo         and check "Add python.exe to PATH" during install.
     pause
     exit /b 1
 )
 
-REM 创建虚拟环境（如不存在）
+REM --- Create virtual environment if missing ---
 if not exist ".venv\Scripts\python.exe" (
-    echo Creating virtual environment...
+    echo [1/3] Creating virtual environment...
     python -m venv .venv
 )
 
-REM 安装依赖
-echo Installing dependencies...
+REM --- Install dependencies ---
+echo [2/3] Installing dependencies...
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt -q
 if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Failed to install dependencies. Check your network.
+    echo [ERROR] Failed to install dependencies. Check your network connection.
     pause
     exit /b 1
 )
 
-REM 运行配置向导
+REM --- Run setup wizard ---
+echo [3/3] Running setup wizard...
 ".venv\Scripts\python.exe" setup.py
 if %ERRORLEVEL% NEQ 0 (
     echo.
