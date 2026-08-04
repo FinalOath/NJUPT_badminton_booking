@@ -79,9 +79,11 @@ def api_post(path, token, data, content_type="application/x-www-form-urlencoded"
 # ---------------------------------------------------------------------------
 # 场地过滤
 # ---------------------------------------------------------------------------
-def is_xianlin(name: str) -> bool:
-    """只选仙林场地，拒绝三牌楼。"""
-    return "仙林" in name and "三牌楼" not in name
+def is_preferred_location(name: str, location: str) -> bool:
+    """按配置的预约地点过滤场地（location 为空表示不限）。"""
+    if not location:
+        return True
+    return location in name
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +252,7 @@ def main():
     targets = cfg.get("booking", {}).get("targets", [])
     schedule_time = cfg.get("booking", {}).get("schedule_time", "12:00")
     book_ahead = cfg.get("booking", {}).get("book_ahead_days", 7)
+    location = cfg.get("booking", {}).get("location", "仙林")  # 仙林/三牌楼/空=不限
 
     is_test = "--test" in args
     is_now = "--now" in args
@@ -278,17 +281,18 @@ def main():
     slots = query_slots(token, target_date, type_id)
     slot_map = {}   # (court_name, start, end) -> stadium_id
     for sid, name, start, end, status, date in slots:
-        if is_xianlin(name):
+        if is_preferred_location(name, location):
             slot_map[(name, start, end)] = sid
 
-    # 同时构建顺延池：所有仙林可用场次
+    # 同时构建顺延池：所有可用场次
     expand_pool = [(s[0], s[1], s[2], s[3], s[5])
-                   for s in slots if s[4] and is_xianlin(s[1])]
+                   for s in slots if s[4] and is_preferred_location(s[1], location)]
 
     # 如果是 --slots，显示后退出
     if is_slots:
-        avail = [s for s in slots if s[4] and is_xianlin(s[1])]
-        print(f"\n  可预约 ({len(avail)} 个，仅仙林):")
+        avail = [s for s in slots if s[4] and is_preferred_location(s[1], location)]
+        loc_txt = f"（{location}）" if location else "（不限地点）"
+        print(f"\n  可预约 ({len(avail)} 个{loc_txt}):")
         for sid, name, start, end, status, date in avail:
             mark = "[ ]" if status else "[X]"
             print(f"  {mark} [{sid:>4}] {name}  {start}-{end}")
@@ -330,11 +334,11 @@ def main():
         print(f"[*] 查询场次: {target_date}")
         slots = query_slots(token, target_date, type_id)
         ranked = match_targets(slots, targets) if targets else [
-            (s[0], s[1], s[2], s[3], s[5]) for s in slots if s[4] and is_xianlin(s[1])
+            (s[0], s[1], s[2], s[3], s[5]) for s in slots if s[4] and is_preferred_location(s[1], location)
         ]
         # 也构建顺延池
         expand_pool = [(s[0], s[1], s[2], s[3], s[5])
-                       for s in slots if s[4] and is_xianlin(s[1])]
+                       for s in slots if s[4] and is_preferred_location(s[1], location)]
         if not ranked:
             print("[-] 无可用场次")
             return 1

@@ -14,9 +14,9 @@ python -c "import requests, yaml, rich, plyer; print('  OK: requests/yaml/rich/p
 echo ""
 echo "[2] 所有模块可导入（无 Windows 依赖泄漏）"
 python - <<'EOF' || { echo "  FAIL: 模块导入失败"; exit 1; }
-import book, token_util, capture_token
+import book, token_util, capture_token, configure
 import token_capture_addon  # addon 顶层不应 import mitmproxy
-print("  OK: book/token_util/capture_token/token_capture_addon 导入正常")
+print("  OK: book/token_util/capture_token/configure/token_capture_addon 导入正常")
 EOF
 
 echo ""
@@ -62,6 +62,11 @@ print("  已注入未过期的假 token")
 EOF
 python book.py --slots > /tmp/out8.log 2>&1; RC8=$?; tail -4 /tmp/out8.log
 echo "  退出码: $RC8（应优雅报告，无 Traceback）"
+
+echo ""
+echo "[9] 无 token 时 configure.py 应优雅提示（不崩溃）"
+python configure.py --slots > /tmp/out9.log 2>&1; RC9=$?; tail -3 /tmp/out9.log
+echo "  退出码: $RC9（期望 1）"
 
 echo ""
 echo "============================================="

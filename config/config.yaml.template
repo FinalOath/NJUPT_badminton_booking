@@ -24,6 +24,8 @@ token_capture:
   refresh_time: "11:30"
 
 booking:
+  # 预约地点: "仙林" / "三牌楼" / 空（不限）。留空则全部场地都抢
+  location: "仙林"
   # 要抢的场次（按优先级从高到低）
   targets:
     - court_name: "仙林体育馆主馆1F羽毛球1号场地"
