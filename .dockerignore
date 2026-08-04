@@ -1,0 +1,16 @@
+# 模拟用户从 GitHub 克隆后的内容，剔除本地开发/敏感数据
+.venv/
+node_modules/
+.git/
+.history/
+data/
+dist/
+dist-*/
+dist-*.zip
+logs/
+config/config.yaml
+.claude/
+__pycache__/
+*.pyc
+backup/
+.pytest_cache/

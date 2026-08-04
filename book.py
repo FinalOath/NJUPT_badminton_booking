@@ -90,7 +90,8 @@ def is_xianlin(name: str) -> bool:
 def pre_fetch_type_id(token):
     """预拉取羽毛球的 typeId（静态数据，只需查一次）。"""
     types = api_get("/venue/user/types", token)
-    for t in types.get("data", []):
+    data = types.get("data") or []  # token 失效时 data 为 null，防御
+    for t in data:
         if "羽毛球" in str(t.get("name", "")):
             tid = t["id"]
             print(f"[+] 羽毛球 typeId = {tid}")
@@ -108,7 +109,7 @@ def query_slots(token, date, type_id=None):
 
     data = api_get(f"/venue/user/time/display/{type_id}", token, {"date": date})
     slots = []
-    for entry in data.get("data", []):
+    for entry in (data.get("data") or []):  # token 失效时 data 为 null，防御
         local_date = entry.get("localDate", date)
         for tf in entry.get("timeFields", []):
             start, end = tf.get("startTime", "")[:5], tf.get("endTime", "")[:5]
@@ -233,9 +234,13 @@ def main():
         tc = cfg.get("token_capture", {}) or {}
         if tc.get("enabled", True):
             print("[*] Token 已过期或缺失，尝试自动抓取（在电脑微信打开南邮小程序即可）...")
-            from capture_token import run_refresh
-            if run_refresh(cfg, tc.get("fallback_timeout_seconds", 60), force=False) == 0:
-                token = load_token()
+            try:
+                from capture_token import run_refresh
+                if run_refresh(cfg, tc.get("fallback_timeout_seconds", 60), force=False) == 0:
+                    token = load_token()
+            except Exception as e:
+                # 未安装 mitmproxy 等环境问题：不应崩溃，给出手动指引
+                print(f"[-] 自动抓取不可用: {e}")
         if not token:
             print("[-] 无有效 token。请运行: python capture_token.py --wait 300")
             print("    （在电脑微信打开南邮小程序 → 进入场地页，捕获后自动保存）")
