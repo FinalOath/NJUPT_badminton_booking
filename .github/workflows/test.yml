@@ -1,0 +1,95 @@
+name: clean-env-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ============ Linux: Docker 纯净环境测试 ============
+  linux-docker:
+    name: Linux 纯净环境 (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建测试镜像
+        run: docker build -f docker/Dockerfile -t badminton-clean-test .
+      - name: 运行纯净环境测试
+        run: docker run --rm badminton-clean-test
+
+  # ============ Windows: 新用户流程（含 .bat 编码） ============
+  windows-novice:
+    name: Windows 新用户流程
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 校验 .bat 文件为纯 ASCII（防 GBK 编码回归）
+        shell: python
+        run: |
+          import glob
+          bats = glob.glob('*.bat') + glob.glob('scripts/*.bat')
+          assert bats, 'no bat files found'
+          for f in bats:
+              text = open(f, encoding='utf-8').read()
+              non = sum(1 for c in text if ord(c) > 127)
+              print(f'{f}: non-ascii={non}')
+              assert non == 0, f'{f} 含非 ASCII 字符，cmd.exe 在 GBK 代码页下会解析崩溃'
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt pytest -q
+
+      - name: 单元测试
+        run: python -m pytest tests/ -q
+
+      - name: setup.py 向导（无 config 时自动生成）
+        run: echo B21000001 | python setup.py
+        continue-on-error: true
+
+      - name: book.py 无 token 优雅降级
+        run: python book.py --slots
+        continue-on-error: true
+
+      - name: capture_token --check 无 mitmproxy 优雅降级
+        run: python capture_token.py --check
+        continue-on-error: true
+
+      - name: configure.py 无 token 优雅降级
+        run: python configure.py --slots
+        continue-on-error: true
+
+  # ============ 构建精简分发包产物 ============
+  build-dist:
+    name: 构建分发包产物
+    needs: [linux-docker, windows-novice]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 构建精简分发包
+        run: |
+          python -m pip install pyyaml -q
+          python scripts/make_dist.py
+      - name: 压缩为 zip
+        run: |
+          python - <<'EOF'
+          import zipfile
+          import os
+          with zipfile.ZipFile('dist-lite.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+              for root, dirs, files in os.walk('dist'):
+                  for f in files:
+                      full = os.path.join(root, f)
+                      z.write(full, os.path.join('dist', os.path.relpath(full, root)))
+          print('dist-lite.zip:', round(os.path.getsize('dist-lite.zip')/1024, 1), 'KB')
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-lite
+          path: dist-lite.zip
+          retention-days: 14
