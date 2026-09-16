@@ -117,12 +117,12 @@ class TestPreFetchTypeId:
 class TestBook:
     def test_success(self, monkeypatch):
         monkeypatch.setattr(book, "api_post", lambda *a, **k: {"success": True, "data": {}})
-        ok, resp = book.book("token", "245", "2026-08-11", "B21000001")
+        ok, resp, _rtt = book.book("token", "245", "2026-08-11", "B21000001")
         assert ok is True
 
     def test_failure(self, monkeypatch):
         monkeypatch.setattr(book, "api_post", lambda *a, **k: {"success": False, "errMsg": "满"})
-        ok, resp = book.book("token", "245", "2026-08-11", "B21000001")
+        ok, resp, _rtt = book.book("token", "245", "2026-08-11", "B21000001")
         assert ok is False
 
     def test_5004_warns(self, monkeypatch):
