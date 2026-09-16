@@ -166,17 +166,19 @@ def _warn_token_5004():
 
 
 def book(token, stadium_id, date, student_id):
-    """预约单个场次，返回 (success, response_json)"""
+    """预约单个场次，返回 (success, response_json, rtt_ms)"""
     ts = str(int(time.time() * 1000))
     fp = calc_fingerprint(stadium_id, student_id, date, ts)
+    t0 = time.perf_counter()
     resp = api_post(
         f"/venue/user/booking/pomelo/v2/{stadium_id}",
         token,
         {"timestamp": ts, "fingerprint": fp, "date": date},
     )
+    rtt_ms = (time.perf_counter() - t0) * 1000
     if isinstance(resp, dict) and resp.get("errCode") == 5004:
         _warn_token_5004()
-    return resp.get("success", False), resp
+    return resp.get("success", False), resp, rtt_ms
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +365,8 @@ def main():
         # 有预加载目标 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00:00.000
         wait_until_server(h, m, server_offset, advance_seconds=6.0)
         server_offset = get_server_offset(token)
-        wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                          on_near=lambda: keepalive_ping(token))
+        fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
+                                         on_near=lambda: keepalive_ping(token))
 
     # 如果没有预加载到目标，现在查（等待已结束或即将结束）
     if not ranked:
@@ -386,8 +388,8 @@ def main():
         if not is_now:
             wait_until_server(h, m, server_offset, advance_seconds=6.0)
             server_offset = get_server_offset(token)
-            wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                              on_near=lambda: keepalive_ping(token))
+            fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
+                                             on_near=lambda: keepalive_ping(token))
 
     if is_test:
         print("[*] 演练模式，未实际预约")
@@ -395,6 +397,9 @@ def main():
 
     # ===== 4. 开始抢购 =====
     top3 = ranked[:3]
+    t_shots_start = time.time()  # 开枪计时起点（首枪发出时刻）
+    if 'fire_delay_s' not in dir():
+        fire_delay_s = None  # --now 模式无等待，无偏差可显示
     print(f"\n{'='*50}")
     print(f"[*] 开始抢购！目标: {[f'{s[1]}-{s[2]}' for s in top3]}")
     print(f"{'='*50}")
@@ -419,16 +424,22 @@ def main():
             slot = ranked[attempt % len(ranked)]
 
         sid, name, start, end, date = slot
-        ok, resp = book(token, sid, date, student_id)
+        ok, resp, rtt_ms = book(token, sid, date, student_id)
 
         if ok:
             detail = resp.get("data", {}).get("detail", {})
+            total_s = time.time() - t_shots_start
             print(f"\n[+] 预约成功！")
             print(f"    场地: {detail.get('stadiumName', name)}")
             print(f"    时间: {detail.get('startTime', start)}-{detail.get('endTime', end)}")
             print(f"    金额: {detail.get('price', 8)} 元")
             print(f"    编号: {resp.get('data', {}).get('order', {}).get('orderId', '')}")
             print(f"[!] 请在 5 分钟内完成支付！")
+            print(f"    ── 预约耗时 ──")
+            if fire_delay_s is not None:
+                print(f"    首枪偏差: {fire_delay_s*1000:+.0f} ms（相对 {schedule_time}:00）")
+            print(f"    命中:     第 {attempt+1} 枪（本枪响应 {rtt_ms:.0f} ms）")
+            print(f"    总耗时:   {total_s:.2f} s（开枪 → 订单确认）")
             return 0
 
         err = resp.get("errMsg", "")
@@ -443,6 +454,7 @@ def main():
             print(f"    # 尝试 {attempt+1}: {name} {start}-{end} -> {err or '失败'}")
 
     print("[-] 抢购失败，所有场次均已满")
+    print(f"    共尝试 200 枪，总耗时 {time.time()-t_shots_start:.1f} s")
     return 1
 
 
