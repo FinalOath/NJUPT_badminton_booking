@@ -66,6 +66,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 复用连接（keepalive）：开抢时避免重新建立 TCP+TLS 连接，单枪延迟从 ~300ms 降到 ~35ms
 SESSION = requests.Session()
+# 抢票流量强制直连：无视系统代理/环境变量，避免代理规则把请求绕到远程节点拖慢 RTT
+SESSION.trust_env = False
 
 
 def api_get(path, token, params=None, timeout=10):
@@ -180,26 +182,35 @@ def book(token, stadium_id, date, student_id):
 # ---------------------------------------------------------------------------
 # 服务器时间同步
 # ---------------------------------------------------------------------------
-def get_server_offset(token):
-    """获取服务器时间与本地时间的偏移（秒）。"""
-    try:
-        t1 = time.time()
-        r = SESSION.get(f"{BASE}/venue/user/types", headers={"token": token}, timeout=5, verify=False)
-        rtt = time.time() - t1
-        date_str = r.headers.get("Date", "")
-        if date_str:
-            # HTTP Date 是 GMT，用 calendar.timegm 按 UTC 解析
-            dt = datetime.strptime(date_str[:-4], "%a, %d %b %Y %H:%M:%S")
-            server_ts = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
-            offset = server_ts + rtt / 2 - t1
-            print(f"    服务器时间偏移: {offset:+.1f}s  (RTT={rtt*1000:.0f}ms)")
-            # 如果本地时间不准给出告警
-            if abs(offset) > 3:
-                print(f"[!] 警告：本地时间与服务器时间差 {offset:.0f}s，已自动修正")
-            return offset
-    except Exception as e:
-        print(f"    [-] 无法同步服务器时间: {e}")
-    return 0.0
+def get_server_offset(token, samples=5):
+    """获取服务器时间与本地时间的偏移（秒）。
+
+    HTTP Date 头精度仅 1 秒，单次采样自带 0~1s 截断误差；
+    截断只会让测量值偏小，故多次采样取最大值（最接近真实，偏早几十 ms 开枪优于偏晚）。
+    """
+    offsets = []
+    for _ in range(samples):
+        try:
+            t1 = time.time()
+            r = SESSION.get(f"{BASE}/venue/user/types", headers={"token": token}, timeout=5, verify=False)
+            rtt = time.time() - t1
+            date_str = r.headers.get("Date", "")
+            if date_str:
+                # HTTP Date 是 GMT，用 calendar.timegm 按 UTC 解析
+                dt = datetime.strptime(date_str[:-4], "%a, %d %b %Y %H:%M:%S")
+                server_ts = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
+                offsets.append(server_ts + rtt / 2 - t1)
+        except Exception:
+            continue
+    if not offsets:
+        print("    [-] 无法同步服务器时间（将退化为本地时间，请确认本机时钟准确）")
+        return 0.0
+    offset = max(offsets)
+    print(f"    服务器时间偏移: {offset:+.1f}s（{len(offsets)} 次采样取最大值）")
+    # 如果本地时间不准给出告警
+    if abs(offset) > 3:
+        print(f"[!] 警告：本地时间与服务器时间差 {offset:.0f}s，已自动修正")
+    return offset
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +360,9 @@ def main():
         wait_until_server(h, m, server_offset, advance_seconds=2.0,
                           on_near=lambda: keepalive_ping(token))
     else:
-        # 有预加载目标 → 精确等到 12:00:00.000
+        # 有预加载目标 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00:00.000
+        wait_until_server(h, m, server_offset, advance_seconds=6.0)
+        server_offset = get_server_offset(token)
         wait_until_server(h, m, server_offset, advance_seconds=0.0,
                           on_near=lambda: keepalive_ping(token))
 
@@ -369,8 +382,10 @@ def main():
         print(f"[*] 目标场次 ({len(ranked)} 个):")
         for sid, name, start, end, date in ranked[:5]:
             print(f"    [{sid}] {name}  {start}-{end}")
-        # 还有时间剩余 → 精确卡 12:00（仅非 --now 模式）
+        # 还有时间剩余 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00（仅非 --now 模式）
         if not is_now:
+            wait_until_server(h, m, server_offset, advance_seconds=6.0)
+            server_offset = get_server_offset(token)
             wait_until_server(h, m, server_offset, advance_seconds=0.0,
                               on_near=lambda: keepalive_ping(token))
 
