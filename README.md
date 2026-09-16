@@ -14,8 +14,11 @@
 
 | 版本 | 说明 |
 |---|---|
-| **dist-完整版.zip**（推荐） | 内置全部软件，解压即用，无需装任何东西 |
+| **badminton-green.zip**（推荐，v1.1.0+） | 绿色免安装版：自带 Python 与全部组件，双击 bat 即用，无需安装任何东西；附一键卸载 |
+| dist-完整版.zip | 内置 mitmproxy，仍需系统 Python（setup.bat 自动配环境） |
 | dist-纯代码版.zip | 需自装 Python 和 mitmproxy（见 [SOFTWARE.md](SOFTWARE.md)） |
+
+> 绿色版的安装与日常使用全部通过双击 `.bat` 完成，完整教程见 [TUTORIAL.md](TUTORIAL.md)。
 
 ### 第 2 步：解压
 
@@ -23,7 +26,10 @@
 
 ### 第 3 步：安装
 
-双击 **`setup.bat`**，按提示操作：
+- **绿色版**（badminton-green.zip）：双击 **`0-首次配置.bat`**；过程中如弹出 Windows 证书安装确认，点【是】
+- **其他版本**：双击 **`setup.bat`**
+
+按提示操作：
 
 1. 输入你的**学号**
 2. 问是否注册每日自动任务（每日自动预约）→ 推荐输入 **y**
@@ -37,7 +43,7 @@
 每天抢票前需要一次有效登录（token 约 3 小时过期）：
 
 ```
-python capture_token.py --wait 300
+python capture_token.py --wait 300      # 绿色版：双击 1-刷新token.bat
 ```
 
 然后**在电脑微信里打开南邮小程序 → 进入场地页**，等待 5~20 秒。看到 `[+] 新 token 已捕获` 即成功。
@@ -48,7 +54,7 @@ python capture_token.py --wait 300
 ### 第 5 步：抢票
 
 ```bash
-python book.py            # 手动抢票（自动等到 12:00，预约当天场次）
+python book.py            # 手动抢票（自动等到 12:00，预约当天场次）；绿色版：双击 2-抢票.bat
 ```
 
 已注册计划任务的用户，每天 **11:55 自动抢票**，无需手动运行。
@@ -87,6 +93,8 @@ python configure.py
 | "端口 8080 被占用" | 关闭 Fiddler 等其他代理工具 |
 | 抢票提示 token 失效 | 运行 `python capture_token.py --refresh` 后重试 |
 | 抢不到场次 | 12:00 竞争激烈属正常，脚本会自动顺延到其他场次 |
+| 想停止每日自动任务 | 绿色版：运行 `app\scripts\uninstall_task.bat` |
+| 想彻底卸载 | 绿色版：双击 `卸载.bat`（自动清理计划任务/根证书/代理残留），再手动删除文件夹 |
 
 ---
 
