@@ -8,7 +8,7 @@ echo "[0] 环境: $(python --version) | cwd: $(pwd)"
 
 echo ""
 echo "[1] 依赖完整性检查（requirements.txt）"
-python -c "import requests, yaml, rich, plyer; print('  OK: requests/yaml/rich/plyer 全部可导入')" \
+python -c "import requests, yaml, rich; print('  OK: requests/yaml/rich 全部可导入')" \
   || { echo "  FAIL: 有依赖缺失"; exit 1; }
 
 echo ""

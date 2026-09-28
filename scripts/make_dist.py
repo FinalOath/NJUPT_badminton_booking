@@ -24,7 +24,8 @@ CORE_FILES = [
 ]
 CONFIG_FILES = ["config/config.yaml.template", "config/config.schema.yaml"]
 SCRIPT_FILES = ["scripts/install_task.ps1", "scripts/setup_proxy.ps1",
-                "scripts/run.bat", "scripts/allow_mitm.bat"]
+                "scripts/run.bat", "scripts/allow_mitm.bat",
+                "scripts/uninstall_task.bat"]
 DOC_FILES = ["README.md", "USAGE.md", "SOFTWARE.md"]
 EXCLUDE_SUFFIXES = (".pyc",)
 

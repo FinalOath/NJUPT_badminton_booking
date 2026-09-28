@@ -126,6 +126,7 @@ python configure.py
 
 - `config\config.yaml`（含学号）和 `data\session_cache.json`（含 token）都只在本机，**不要分享**
 - 脚本仅向 `wechat.njupt.edu.cn` 发送预约请求
+- 刷新 token 时系统代理会临时切到本机抓包端口，仅解密 `wechat.njupt.edu.cn` 的 HTTPS 流量，其余域名原样转发、不解密，结束后自动还原代理
 
 ## License
 

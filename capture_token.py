@@ -3,8 +3,9 @@
 自动抓取并刷新预约 token 的 CLI（在仓库 .venv 环境运行）。
 
 原理：启动 mitmdump（已随 mitmproxy 安装），把 Windows 系统代理切到本机端口
-（与 Fiddler 相同机制，PC 微信可走代理），你在电脑微信/手机上打开南邮小程序
-进入场地页，addon 自动从流量里提取新 token 写入 data/session_cache.json，
+（与 Fiddler 相同机制，PC 微信可走代理），并仅对南邮小程序域名（wechat.njupt.edu.cn）
+做 TLS 拦截/解密（--allow-hosts），其余域名原样转发、不解密；你在电脑微信/手机上
+打开南邮小程序进入场地页，addon 自动从流量里提取新 token 写入 data/session_cache.json，
 随后自动还原代理并退出。
 
 用法:
@@ -31,6 +32,9 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
 ADDON_PATH = BASE_DIR / "token_capture_addon.py"
 MITM_BIN_DIR = Path("D:/Program Files/mitmproxy/bin")
+# 仅对南邮小程序域名做 TLS 拦截/解密，其余域名原样转发、不解密
+# （--allow-hosts 与 --ignore-hosts 语义相反：只放行匹配的主机，其余一律直通）
+MITM_ALLOW_HOST = r"^wechat\.njupt\.edu\.cn$"
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 
@@ -151,7 +155,8 @@ def spawn_mitmdump(port, env):
         raise RuntimeError("未找到 mitmdump，请先安装 mitmproxy")
     log_path = BASE_DIR / "data" / "mitmdump.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [exe, "--listen-port", str(port), "--ssl-insecure", "-s", str(ADDON_PATH)]
+    cmd = [exe, "--listen-port", str(port), "--ssl-insecure",
+           "--allow-hosts", MITM_ALLOW_HOST, "-s", str(ADDON_PATH)]
     logf = open(log_path, "ab")
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
