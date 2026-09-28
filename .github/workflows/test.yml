@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 代码清理回归护栏（死文件/死依赖/死配置/MITM 收窄/退避重试）
+        run: python3 scripts/ci_cleanup_guard.py
       - name: 构建测试镜像
         run: docker build -f docker/Dockerfile -t badminton-clean-test .
       - name: 运行纯净环境测试
@@ -21,6 +23,8 @@ jobs:
   windows-novice:
     name: Windows 新用户流程
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,6 +43,9 @@ jobs:
               print(f'{f}: non-ascii={non}')
               assert non == 0, f'{f} 含非 ASCII 字符，cmd.exe 在 GBK 代码页下会解析崩溃'
 
+      - name: 代码清理回归护栏（死文件/死依赖/死配置/MITM 收窄/退避重试）
+        run: python scripts/ci_cleanup_guard.py
+
       - name: 安装依赖
         run: python -m pip install -r requirements.txt pytest -q
 
@@ -49,17 +56,60 @@ jobs:
         run: echo B21000001 | python setup.py
         continue-on-error: true
 
-      - name: book.py 无 token 优雅降级
-        run: python book.py --slots
-        continue-on-error: true
+      - name: 生成最小 config（供优雅降级测试，关闭自动抓包）
+        shell: python
+        run: |
+          import pathlib
+          pathlib.Path('config').mkdir(exist_ok=True)
+          pathlib.Path('config/config.yaml').write_text(
+              'auth:\n'
+              '  student_id: "B21000001"\n'
+              '  cas_mode: "wecom"\n'
+              '\n'
+              'token_capture:\n'
+              '  enabled: false\n'
+              '  timeout_seconds: 300\n'
+              '  fallback_timeout_seconds: 60\n'
+              '  mitm_port: 8080\n'
+              '  mode: pc_wechat\n'
+              '  refresh_time: "11:30"\n'
+              '\n'
+              'booking:\n'
+              '  location: ""\n'
+              '  targets:\n'
+              '    - court_name: "court-1"\n'
+              '      time: "16:00-17:00"\n'
+              '  schedule_time: "12:00"\n',
+              encoding='utf-8',
+          )
+          print('config/config.yaml written (token_capture.enabled=false)')
+
+      - name: book.py 无 token 优雅降级（退出码 1、无 Traceback）
+        shell: pwsh
+        run: |
+          $out = python book.py --slots 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($out -match 'Traceback') { throw "book.py --slots 出现 Traceback（未优雅降级）" }
+          if ($rc -ne 1) { throw "book.py --slots 期望退出码 1，实际 $rc" }
 
       - name: capture_token --check 无 mitmproxy 优雅降级
-        run: python capture_token.py --check
-        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = python capture_token.py --check 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($out -match 'Traceback') { throw "capture_token --check 出现 Traceback" }
+          if ($rc -ne 1) { throw "capture_token --check 期望退出码 1，实际 $rc" }
 
       - name: configure.py 无 token 优雅降级
-        run: python configure.py --slots
-        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = python configure.py --slots 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($out -match 'Traceback') { throw "configure.py --slots 出现 Traceback" }
+          if ($rc -ne 1) { throw "configure.py --slots 期望退出码 1，实际 $rc" }
 
   # ============ 构建精简分发包产物 ============
   build-dist:

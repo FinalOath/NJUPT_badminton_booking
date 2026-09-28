@@ -424,7 +424,14 @@ def main():
             slot = ranked[attempt % len(ranked)]
 
         sid, name, start, end, date = slot
-        ok, resp, rtt_ms = book(token, sid, date, student_id)
+        try:
+            ok, resp, rtt_ms = book(token, sid, date, student_id)
+        except Exception as e:
+            # 网络抖动/后端异常时退避重试，避免整场抢票因单枪异常而崩溃
+            if attempt % 10 == 0:
+                print(f"    # 尝试 {attempt+1}: 网络异常（{e}），0.5s 后重试")
+            time.sleep(0.5)
+            continue
 
         if ok:
             detail = resp.get("data", {}).get("detail", {})

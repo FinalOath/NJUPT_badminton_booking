@@ -7,12 +7,7 @@
 auth:
   # 你的学号（南邮统一身份认证账号）
   student_id: ""
-  password: ""
   cas_mode: "wecom"
-
-api:
-  base_url: "https://wechat.njupt.edu.cn/mini_program/v4"
-  timeout_seconds: 30
 
 token_capture:
   # 自动抓包刷新 token
@@ -41,7 +36,3 @@ booking:
     - court_name: "仙林体育馆3F羽毛球馆2号场地"
       time: "17:00-18:00"
   schedule_time: "12:00"
-
-notify:
-  enable_desktop: true
-  enable_console: true
