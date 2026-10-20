@@ -129,7 +129,6 @@ def main():
     print(" 4) 强制刷新 token: python capture_token.py --refresh")
     if not has_mitm:
         print("\n[!] 注意：mitmproxy 未就绪，token 自动刷新不可用。请先安装 mitmproxy 后重跑本向导。")
-        return 1
     return 0
 
 

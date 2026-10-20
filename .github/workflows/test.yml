@@ -92,6 +92,7 @@ jobs:
           Write-Host $out
           if ($out -match 'Traceback') { throw "book.py --slots 出现 Traceback（未优雅降级）" }
           if ($rc -ne 1) { throw "book.py --slots 期望退出码 1，实际 $rc" }
+          exit 0  # 退出码1=预期优雅降级，显式置0防止 pwsh 泄漏 native 退出码
 
       - name: capture_token --check 无 mitmproxy 优雅降级
         shell: pwsh
@@ -101,6 +102,7 @@ jobs:
           Write-Host $out
           if ($out -match 'Traceback') { throw "capture_token --check 出现 Traceback" }
           if ($rc -ne 1) { throw "capture_token --check 期望退出码 1，实际 $rc" }
+          exit 0  # 退出码1=预期优雅降级，显式置0防止 pwsh 泄漏 native 退出码
 
       - name: configure.py 无 token 优雅降级
         shell: pwsh
@@ -110,6 +112,7 @@ jobs:
           Write-Host $out
           if ($out -match 'Traceback') { throw "configure.py --slots 出现 Traceback" }
           if ($rc -ne 1) { throw "configure.py --slots 期望退出码 1，实际 $rc" }
+          exit 0  # 退出码1=预期优雅降级，显式置0防止 pwsh 泄漏 native 退出码
 
   # ============ 构建精简分发包产物 ============
   build-dist:
