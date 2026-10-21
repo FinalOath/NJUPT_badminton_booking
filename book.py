@@ -19,6 +19,7 @@ import calendar
 import hashlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -274,6 +275,37 @@ def keepalive_ping(token):
         pass
 
 
+def warm_connections(token, n=3):
+    """开抢前并发发 n 个轻量请求，让连接池养 n 条 keepalive 连接，供首枪并发复用。"""
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        for _ in range(n):
+            pool.submit(keepalive_ping, token)
+
+
+def _print_fire_banner(top3):
+    """打印开抢横幅（放在等待之前，避免 12:00 整点被控制台 I/O 拖慢首枪）。"""
+    print(f"\n{'='*50}")
+    print(f"[*] 开始抢购！目标: {[f'{s[1]}-{s[2]}' for s in top3]}")
+    print(f"{'='*50}")
+
+
+def _report_success(resp, name, start, end, hit_note, rtt_ms, t_shots_start, fire_delay_s, schedule_time):
+    """打印预约成功结果（顺序首枪与并发首枪共用）。"""
+    detail = resp.get("data", {}).get("detail", {})
+    total_s = time.time() - t_shots_start
+    print(f"\n[+] 预约成功！")
+    print(f"    场地: {detail.get('stadiumName', name)}")
+    print(f"    时间: {detail.get('startTime', start)}-{detail.get('endTime', end)}")
+    print(f"    金额: {detail.get('price', 8)} 元")
+    print(f"    编号: {resp.get('data', {}).get('order', {}).get('orderId', '')}")
+    print(f"[!] 请在 5 分钟内完成支付！")
+    print(f"    ── 预约耗时 ──")
+    if fire_delay_s is not None:
+        print(f"    首枪偏差: {fire_delay_s*1000:+.0f} ms（相对 {schedule_time}:00）")
+    print(f"    命中:      {hit_note}（本枪响应 {rtt_ms:.0f} ms）")
+    print(f"    总耗时:   {total_s:.2f} s（开枪 → 订单确认）")
+
+
 def _call_with_retry(fn, tries=3, delay=1.0, what=""):
     """开抢前的准备请求重试（网络抖动不致命；不触碰抢票热循环）。"""
     last = None
@@ -416,13 +448,14 @@ def main():
     elif not ranked:
         # 无预加载目标 → 提前 2 秒查场次，然后卡 12:00
         wait_until_server(h, m, server_offset, advance_seconds=2.0,
-                          on_near=lambda: keepalive_ping(token))
+                          on_near=lambda: warm_connections(token))
     else:
         # 有预加载目标 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00:00.000
+        _print_fire_banner(ranked[:3])
         wait_until_server(h, m, server_offset, advance_seconds=6.0)
         server_offset = get_server_offset(token)
         fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                                         on_near=lambda: keepalive_ping(token))
+                                         on_near=lambda: warm_connections(token))
 
     # 如果没有预加载到目标，现在查（等待已结束或即将结束）
     if not ranked:
@@ -442,10 +475,11 @@ def main():
             print(f"    [{sid}] {name}  {start}-{end}")
         # 还有时间剩余 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00（仅非 --now 模式）
         if not is_now:
+            _print_fire_banner(ranked[:3])
             wait_until_server(h, m, server_offset, advance_seconds=6.0)
             server_offset = get_server_offset(token)
             fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                                             on_near=lambda: keepalive_ping(token))
+                                             on_near=lambda: warm_connections(token))
 
     if is_test:
         print("[*] 演练模式，未实际预约")
@@ -454,9 +488,41 @@ def main():
     # ===== 4. 开始抢购 =====
     top3 = ranked[:3]
     t_shots_start = time.time()  # 开枪计时起点（首枪发出时刻）
-    print(f"\n{'='*50}")
-    print(f"[*] 开始抢购！目标: {[f'{s[1]}-{s[2]}' for s in top3]}")
-    print(f"{'='*50}")
+
+    if is_now:
+        _print_fire_banner(top3)
+
+    # 首枪并发：12:00 一到同时打 top3，任一成功即停（命中第 2/3 目标的时间压到接近单枪 RTT）
+    # 注意：若多个目标同时可订，服务端可能同时成交多单——与顺序版"只订最高优先"不同，需留意
+    if len(top3) > 1:
+        pool = None
+        try:
+            pool = ThreadPoolExecutor(max_workers=len(top3))
+            futures = {pool.submit(book, token, s[0], s[4], student_id): s for s in top3}
+            over_limit = False
+            for fut in as_completed(futures):
+                sid, name, start, end, date = futures[fut]
+                try:
+                    ok, resp, rtt_ms = fut.result()
+                except Exception as e:
+                    print(f"    # 并发首枪 {name} {start}-{end}: 网络异常（{e}）")
+                    continue
+                if ok:
+                    _report_success(resp, name, start, end, "并发首枪", rtt_ms,
+                                    t_shots_start, fire_delay_s, schedule_time)
+                    return 0
+                err = resp.get("errMsg", "")
+                if "超限" in err:
+                    over_limit = True
+            if over_limit:
+                print(f"[-] 预约超限（已有未支付的订单），先取消旧订单")
+                return 1
+        except Exception as e:
+            print(f"    [!] 并发首枪异常，退回顺序抢购（{e}）")
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+
     for attempt in range(200):
         now = datetime.now()
         phase = "high" if (now.hour == h and now.minute == m and now.second < 2) else "normal"
@@ -482,25 +548,14 @@ def main():
             ok, resp, rtt_ms = book(token, sid, date, student_id)
         except Exception as e:
             # 网络抖动/后端异常时退避重试，避免整场抢票因单枪异常而崩溃
-            if attempt % 10 == 0:
+            if phase != "high" and attempt % 10 == 0:
                 print(f"    # 尝试 {attempt+1}: 网络异常（{e}），0.5s 后重试")
             time.sleep(0.5)
             continue
 
         if ok:
-            detail = resp.get("data", {}).get("detail", {})
-            total_s = time.time() - t_shots_start
-            print(f"\n[+] 预约成功！")
-            print(f"    场地: {detail.get('stadiumName', name)}")
-            print(f"    时间: {detail.get('startTime', start)}-{detail.get('endTime', end)}")
-            print(f"    金额: {detail.get('price', 8)} 元")
-            print(f"    编号: {resp.get('data', {}).get('order', {}).get('orderId', '')}")
-            print(f"[!] 请在 5 分钟内完成支付！")
-            print(f"    ── 预约耗时 ──")
-            if fire_delay_s is not None:
-                print(f"    首枪偏差: {fire_delay_s*1000:+.0f} ms（相对 {schedule_time}:00）")
-            print(f"    命中:     第 {attempt+1} 枪（本枪响应 {rtt_ms:.0f} ms）")
-            print(f"    总耗时:   {total_s:.2f} s（开枪 → 订单确认）")
+            _report_success(resp, name, start, end, f"第 {attempt+1} 枪", rtt_ms,
+                            t_shots_start, fire_delay_s, schedule_time)
             return 0
 
         err = resp.get("errMsg", "")
@@ -511,7 +566,7 @@ def main():
         if attempt > 50 and phase == "normal":
             time.sleep(2.0)
 
-        if attempt % 10 == 0:
+        if phase != "high" and attempt % 10 == 0:
             print(f"    # 尝试 {attempt+1}: {name} {start}-{end} -> {err or '失败'}")
 
     print("[-] 抢购失败，所有场次均已满")
