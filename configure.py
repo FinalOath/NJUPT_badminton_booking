@@ -9,6 +9,7 @@
 需要先有有效 token（运行一次 capture_token.py 捕获后）。
 """
 
+import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,8 +29,12 @@ console = Console()
 def load_config():
     if not CONFIG_PATH.exists():
         console.print(f"[red]缺少 {CONFIG_PATH}，请先运行 setup.bat 生成[/red]")
-        sys.exit(1)
-    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+        return None
+    try:
+        return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        console.print(f"[red]配置文件解析失败: {e}[/red]")
+        return None
 
 
 def render_config(cfg):
@@ -171,8 +176,14 @@ def update_basic_info(cfg):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="交互式预约配置向导")
+    parser.add_argument("--slots", action="store_true", help="只查看当天场地表格（不修改配置）")
+    args = parser.parse_args()
+    is_slots_only = args.slots
+
     cfg = load_config()
-    is_slots_only = "--slots" in sys.argv
+    if cfg is None:
+        return 1
 
     if not is_slots_only:
         console.print("[bold]===== 预约配置向导 =====[/bold]")

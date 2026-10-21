@@ -7,16 +7,24 @@
   python book.py --slots      # 查看可用场次
   python book.py --test       # 演练（不实际预约）
   python book.py --now        # 立即预约（不等待 12:00）
+  python book.py --refresh    # 强制重新抓取 token 后退出
+  python book.py --help       # 查看全部参数
 
 配置: config/config.yaml
 Token: data/session_cache.json（自动保存，过期可重新抓取）
 """
 
-import calendar, hashlib, sys, time, yaml
+import argparse
+import calendar
+import hashlib
+import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
+import urllib3
+import yaml
 
 import token_util
 
@@ -30,8 +38,22 @@ TOKEN_SALT = "4pGmY6s9zX"  # 从反编译源码提取
 
 
 def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """读取并解析配置；缺失/损坏时返回 None（调用方决定退出码）。"""
+    if not CONFIG_PATH.exists():
+        print(f"[!] 未找到配置文件 {CONFIG_PATH}")
+        print("    请先运行 setup.bat 或 python setup.py 生成配置")
+        return None
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except Exception as e:
+        print(f"[!] 配置文件解析失败: {e}")
+        print(f"    请检查 {CONFIG_PATH} 的 YAML 语法")
+        return None
+    if not isinstance(cfg, dict):
+        print("[!] 配置文件格式错误：顶层应为键值映射")
+        return None
+    return cfg
 
 
 def load_token():
@@ -61,7 +83,6 @@ BASE = "https://wechat.njupt.edu.cn/mini_program/v4"
 
 
 # 禁用 SSL 警告（南邮小程序后端使用非公开证书）
-import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 复用连接（keepalive）：开抢时避免重新建立 TCP+TLS 连接，单枪延迟从 ~300ms 降到 ~35ms
@@ -253,12 +274,35 @@ def keepalive_ping(token):
         pass
 
 
+def _call_with_retry(fn, tries=3, delay=1.0, what=""):
+    """开抢前的准备请求重试（网络抖动不致命；不触碰抢票热循环）。"""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(delay)
+    print(f"[-] {what}失败：重试 {tries} 次后仍报错（{last}）")
+    return None
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="南邮羽毛球场地预约（自动等待到 schedule_time 精确开抢）")
+    parser.add_argument("--slots", action="store_true", help="查看可用场次后退出")
+    parser.add_argument("--test", action="store_true", help="演练模式（不实际预约）")
+    parser.add_argument("--now", action="store_true", help="立即预约（不等待 schedule_time）")
+    parser.add_argument("--refresh", action="store_true", help="强制重新抓取 token 后退出")
+    args = parser.parse_args()
+
     cfg = load_config()
-    args = set(sys.argv[1:])
+    if cfg is None:
+        return 1
 
     # --refresh: 强制重新抓取 token 后退出（不预约）
-    if "--refresh" in args:
+    if args.refresh:
         from capture_token import run_refresh
         tc = cfg.get("token_capture", {}) or {}
         return run_refresh(cfg, tc.get("timeout_seconds", 300), force=True)
@@ -286,18 +330,28 @@ def main():
     schedule_time = cfg.get("booking", {}).get("schedule_time", "12:00")
     location = cfg.get("booking", {}).get("location", "仙林")  # 仙林/三牌楼/空=不限
 
-    is_test = "--test" in args
-    is_now = "--now" in args
-    is_slots = "--slots" in args
+    is_test = args.test
+    is_now = args.now
+    is_slots = args.slots
 
     # 预约日期固定为当天
     target_date = datetime.now().strftime("%Y-%m-%d")
 
-    h, m = map(int, schedule_time.split(":"))
+    # 校验 schedule_time 格式（HH:MM），避免配置手误导致崩溃
+    try:
+        h, m = map(int, str(schedule_time).split(":"))
+    except ValueError:
+        print(f"[!] booking.schedule_time 格式错误: {schedule_time!r}（应为 HH:MM，如 12:00）")
+        return 1
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        print(f"[!] booking.schedule_time 超出范围: {schedule_time!r}")
+        return 1
+
+    fire_delay_s = None  # 首枪偏差（--now 模式无等待，保持 None）
 
     # ===== 1. 预拉取 + 时间同步 =====
     print("[*] 预拉取运动类型...")
-    type_id = pre_fetch_type_id(token)
+    type_id = _call_with_retry(lambda: pre_fetch_type_id(token), what="预拉取运动类型")
     if not type_id:
         return 1
 
@@ -306,7 +360,9 @@ def main():
 
     # ===== 2. 提前查场次（获取场地 ID 映射）=====
     print(f"[*] 预查场次: {target_date}")
-    slots = query_slots(token, target_date, type_id)
+    slots = _call_with_retry(lambda: query_slots(token, target_date, type_id), what="预查场次")
+    if slots is None:
+        return 1
     slot_map = {}   # (court_name, start, end) -> stadium_id
     for sid, name, start, end, status, date in slots:
         if is_preferred_location(name, location):
@@ -398,8 +454,6 @@ def main():
     # ===== 4. 开始抢购 =====
     top3 = ranked[:3]
     t_shots_start = time.time()  # 开枪计时起点（首枪发出时刻）
-    if 'fire_delay_s' not in dir():
-        fire_delay_s = None  # --now 模式无等待，无偏差可显示
     print(f"\n{'='*50}")
     print(f"[*] 开始抢购！目标: {[f'{s[1]}-{s[2]}' for s in top3]}")
     print(f"{'='*50}")
@@ -466,4 +520,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[!] 已取消")
+        sys.exit(130)

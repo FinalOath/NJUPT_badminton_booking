@@ -133,7 +133,11 @@ class TokenCapture:
         # 补充来源：登录响应的 token 最新鲜
         if flow.request.path.startswith(LOGIN_PATHS) and flow.response:
             try:
-                body = json.loads(flow.response.get_text() or "{}")
+                # 兼容 mitmproxy 各版本：新版用 .text，旧版用 get_text()
+                text = getattr(flow.response, "text", None)
+                if text is None:
+                    text = flow.response.get_text()
+                body = json.loads(text or "{}")
             except Exception:
                 return
             for t in _jwts_in_body(body):

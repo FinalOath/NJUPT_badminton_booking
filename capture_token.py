@@ -31,7 +31,12 @@ import token_util
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
 ADDON_PATH = BASE_DIR / "token_capture_addon.py"
-MITM_BIN_DIR = Path("D:/Program Files/mitmproxy/bin")
+# mitmproxy 常见安装路径（D:/C: 盘都覆盖，兼容不同用户习惯）
+MITM_BIN_DIRS = [
+    Path("D:/Program Files/mitmproxy/bin"),
+    Path("C:/Program Files/mitmproxy/bin"),
+    Path("C:/Program Files (x86)/mitmproxy/bin"),
+]
 # 仅对南邮小程序域名做 TLS 拦截/解密，其余域名原样转发、不解密
 # （--allow-hosts 与 --ignore-hosts 语义相反：只放行匹配的主机，其余一律直通）
 MITM_ALLOW_HOST = r"^wechat\.njupt\.edu\.cn$"
@@ -49,10 +54,11 @@ def find_mitmdump():
         if p.exists():
             return str(p)
     # 2. 本机常见安装路径
-    for name in ("mitmdump.exe", "mitmdump"):
-        p = MITM_BIN_DIR / name
-        if p.exists():
-            return str(p)
+    for base in MITM_BIN_DIRS:
+        for name in ("mitmdump.exe", "mitmdump"):
+            p = base / name
+            if p.exists():
+                return str(p)
     # 3. PATH
     import shutil
     return shutil.which("mitmdump")
