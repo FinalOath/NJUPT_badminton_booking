@@ -132,6 +132,8 @@ booking:
 | `python book.py --slots` | 查看场次（只读） |
 | `python book.py --test` | 演练（不实际预约） |
 | `python book.py --now` | 立即抢（不等 12:00） |
+| `python book.py --refresh` | 强制重新抓取 token 后退出 |
+| `python book.py --help` | 查看全部参数 |
 | `python benchmark.py` | 抢票性能基准 |
 
 ---
