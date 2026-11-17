@@ -14,4 +14,5 @@ def test_launcher_bytes_use_ascii_and_crlf(tmp_path):
     assert data.count(b"\n") == data.count(b"\r\n")
     assert "gui.py" in module.APP_FILES
     assert "certificate_manager.py" in module.APP_FILES
+    assert {"runtime.py", "scheduling.py"}.issubset(module.APP_FILES)
     assert all("config.yaml" not in p and "session_cache" not in p for p in module.APP_FILES)

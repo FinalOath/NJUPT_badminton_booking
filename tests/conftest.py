@@ -6,6 +6,18 @@ import capture_token
 import token_util
 
 
+@pytest.fixture(scope="session")
+def tk_root():
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+    except tkinter.TclError as exc:
+        pytest.skip(f"当前测试环境无法创建窗口: {exc}")
+    root.withdraw()
+    yield root
+    root.destroy()
+
+
 @pytest.fixture(autouse=True)
 def isolate_side_effects(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "DATA_DIR", tmp_path / "data")

@@ -11,16 +11,6 @@ import gui
 import token_util
 
 
-@pytest.fixture(scope="module")
-def tk_root():
-    tk = pytest.importorskip("tkinter")
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:
-        pytest.skip(str(exc))
-    root.withdraw()
-    yield root
-    root.destroy()
 
 
 @pytest.fixture
@@ -116,16 +106,20 @@ def test_refresh_keeps_edited_and_unavailable_targets(app):
 def test_capture_cancel_restores_proxy(monkeypatch):
     event = threading.Event()
     restored = []
+    state = [(0, "")]
     monkeypatch.setattr(capture_token, "find_free_port", lambda p: p)
-    monkeypatch.setattr(capture_token, "_read_proxy_state", lambda: (0, ""))
+    monkeypatch.setattr(capture_token, "_read_proxy_state", lambda: state[0])
     monkeypatch.setattr(token_util, "current_best_exp", lambda: 0)
     monkeypatch.setattr(capture_token, "spawn_mitmdump", lambda *a: object())
     monkeypatch.setattr(capture_token, "wait_for_proxy_ready", lambda *a: True)
-    monkeypatch.setattr(capture_token, "set_system_proxy", lambda *a: event.set())
+    def switch_proxy(enabled, port):
+        state[0] = (1, f"127.0.0.1:{port}")
+        event.set()
+    monkeypatch.setattr(capture_token, "set_system_proxy", switch_proxy)
     monkeypatch.setattr(capture_token, "_stop_mitmdump", lambda p: restored.append("stopped"))
     monkeypatch.setattr(capture_token, "_restore_proxy_state", lambda s: restored.append(s))
     assert capture_token.run_refresh({}, 300, force=True, stop_event=event) == 130
-    assert restored == ["stopped", (0, "")]
+    assert restored == [(0, ""), "stopped"]
 
 
 def test_first_use_saves_account_without_booking_targets(app, tmp_path):
@@ -176,7 +170,7 @@ def test_proxy_not_enabled_if_worker_start_fails(monkeypatch):
     restored = []
     monkeypatch.setattr(capture_token, "find_free_port", lambda p: p)
     monkeypatch.setattr(capture_token, "spawn_mitmdump", lambda *a: object())
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("worker exited")
     monkeypatch.setattr(capture_token, "wait_for_proxy_ready", fail)
     monkeypatch.setattr(capture_token, "set_system_proxy", lambda *a: pytest.fail("proxy enabled too early"))
@@ -184,7 +178,7 @@ def test_proxy_not_enabled_if_worker_start_fails(monkeypatch):
     monkeypatch.setattr(capture_token, "_restore_proxy_state", lambda s: restored.append("restored"))
     with pytest.raises(RuntimeError):
         capture_token.run_refresh({}, 300, force=True)
-    assert restored == ["stopped", "restored"]
+    assert restored == ["stopped"]
 
 
 def test_forced_capture_accepts_observed_same_token(monkeypatch):

@@ -15,7 +15,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_FILES = ("gui.py", "gui_start.py", "certificate_manager.py", "capture_token.py", "token_util.py",
-             "token_capture_addon.py", "book.py", "configure.py", "setup.py")
+             "token_capture_addon.py", "book.py", "configure.py", "setup.py",
+             "runtime.py", "scheduling.py")
 
 
 def write_bat(path, text):

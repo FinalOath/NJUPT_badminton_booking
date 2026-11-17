@@ -5,16 +5,6 @@ import dashboard
 import runtime
 
 
-@pytest.fixture(scope="module")
-def tk_root():
-    tkinter = pytest.importorskip("tkinter")
-    try:
-        root = tkinter.Tk()
-    except tkinter.TclError as e:
-        pytest.skip(f"当前测试环境无法创建窗口: {e}")
-    root.withdraw()
-    yield root
-    root.destroy()
 
 
 @pytest.fixture

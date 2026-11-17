@@ -3,9 +3,8 @@
 自动抓取并刷新预约 token 的 CLI（在仓库 .venv 环境运行）。
 
 原理：启动 mitmdump（已随 mitmproxy 安装），把 Windows 系统代理切到本机端口
-（与 Fiddler 相同机制，PC 微信可走代理），并仅对南邮小程序域名（wechat.njupt.edu.cn）
-做 TLS 拦截/解密（--allow-hosts），其余域名原样转发、不解密；你在电脑微信/手机上
-打开南邮小程序进入场地页，addon 自动从流量里提取新 token 写入 data/session_cache.json，
+（与 Fiddler 相同机制，PC 微信可走代理），你在电脑微信/手机上打开南邮小程序
+进入场地页，addon 自动从流量里提取新 token 写入 data/session_cache.json，
 随后自动还原代理并退出。
 
 用法:
@@ -16,41 +15,81 @@
 """
 
 import argparse
-from contextlib import contextmanager
 import os
 import socket
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
 import token_util
+import runtime
+import scheduling
+
+class CaptureError(RuntimeError):
+    pass
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
 ADDON_PATH = BASE_DIR / "token_capture_addon.py"
-# mitmproxy 常见安装路径（D:/C: 盘都覆盖，兼容不同用户习惯）
 MITM_BIN_DIRS = [
     Path("D:/Program Files/mitmproxy/bin"),
     Path("C:/Program Files/mitmproxy/bin"),
     Path("C:/Program Files (x86)/mitmproxy/bin"),
 ]
-# 仅对南邮小程序域名做 TLS 拦截/解密，其余域名原样转发、不解密
-# （--allow-hosts 与 --ignore-hosts 语义相反：只放行匹配的主机，其余一律直通）
 MITM_ALLOW_HOST = r"^wechat\.njupt\.edu\.cn$"
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-
-
-class CaptureError(RuntimeError):
-    """An actionable public message which contains no captured credentials."""
 
 
 # ---------------------------------------------------------------------------
 # 环境探测
 # ---------------------------------------------------------------------------
+@contextmanager
+def capture_session():
+    """Only one capture process may temporarily own the user's system proxy."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    ctypes.set_last_error(0)
+    handle = kernel.CreateMutexW(None, False, "Local\\NJUPTBadmintonTokenCapture")
+    error = ctypes.get_last_error()
+    if not handle:
+        raise CaptureError("无法创建登录获取会话")
+    try:
+        if error == 183:  # ERROR_ALREADY_EXISTS
+            raise CaptureError("另一个窗口正在获取登录，请先取消或等待它结束")
+        yield
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def wait_for_proxy_ready(proc, port, stop_event=None, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        runtime.check_stop("capture")
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if proc.poll() is not None:
+            raise CaptureError("抓包组件启动失败，请检查 data/mitmdump.log")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    raise CaptureError("抓包组件未就绪，请检查 data/mitmdump.log")
+
+
 def find_mitmdump():
     # GUI portable builds include the library in this interpreter, including
     # when launched through pythonw.exe. Never execute a .bat through a shell.
@@ -171,6 +210,7 @@ def spawn_mitmdump(port, env):
     log_path = BASE_DIR / "data" / "mitmdump.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     args = ["--listen-port", str(port), "--ssl-insecure",
+            "--listen-host", env.get("NJUPT_LISTEN_HOST", "127.0.0.1"),
             "--allow-hosts", MITM_ALLOW_HOST, "-s", str(ADDON_PATH)]
     if exe == sys.executable:
         cmd = [exe, "-c", "from mitmproxy.tools.main import mitmdump; mitmdump()"] + args
@@ -204,49 +244,38 @@ def _stop_mitmdump(proc):
         pass
 
 
-def wait_for_proxy_ready(proc, port, stop_event=None, timeout=15):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if stop_event is not None and stop_event.is_set():
-            return False
-        if proc.poll() is not None:
-            raise CaptureError("抓包组件启动失败，请检查 data/mitmdump.log")
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return True
-        except OSError:
-            time.sleep(0.1)
-    raise CaptureError("抓包组件未就绪，请检查 data/mitmdump.log")
-
-
 # ---------------------------------------------------------------------------
 # 等待捕获
 # ---------------------------------------------------------------------------
-def wait_for_token(initial_exp, timeout, stop_event=None, initial_mtime_ns=None,
-                   expected_student_id=""):
-    """轮询缓存：出现 exp 高于 initial_exp 的新 token 即返回。"""
+def wait_for_token(initial_exp, timeout, required_until=0, initial_token=None,
+                   *, stop_event=None, initial_mtime_ns=None, expected_student_id=""):
+    """等待有效期足够的新 token；强制刷新也允许相同 exp 的不同凭据。"""
     deadline = time.monotonic() + timeout
     last_report = 0.0
     while time.monotonic() < deadline:
+        runtime.check_stop("capture")
         if stop_event is not None and stop_event.is_set():
             return ""
-        tok = token_util.read_cached_token()
-        cur = token_util.jwt_exp(tok) or 0
+        cur = token_util.current_best_exp()
+        candidate = token_util.read_cached_token()
+        changed = candidate and initial_token is not None and candidate != initial_token
         try:
             observed = (initial_mtime_ns is not None and
                         token_util.TOKEN_PATH.stat().st_mtime_ns != initial_mtime_ns)
         except FileNotFoundError:
             observed = False
-        if tok and (not expected_student_id or token_util.token_student_id(tok) == expected_student_id) and (cur > initial_exp or observed):
-            return tok
+        account_matches = (not expected_student_id or
+                           token_util.token_student_id(candidate) == expected_student_id)
+        if candidate and account_matches and (cur > initial_exp or changed or observed) and cur > required_until:
+            return candidate
         now = time.monotonic()
         if now - last_report >= 10:
             last_report = now
             print(f"    ... 等待捕获中（还剩 {int(deadline - now)}s）请在微信里打开南邮小程序并进入场地页")
         if stop_event is None:
-            time.sleep(1)
+            runtime.pause(1, "capture")
         else:
-            stop_event.wait(1)
+            stop_event.wait(0.2)
     return ""
 
 
@@ -254,7 +283,7 @@ def print_instructions(mode, port):
     if mode == "phone":
         ip = local_ip()
         print(f"[*] 系统代理已开启（供手机使用 {ip}:{port}）")
-        print("    手机设置: 同局域网下把 WiFi 代理指向 {ip}:{port}（iOS Shadowrocket 可加规则）")
+        print(f"    手机设置: 同局域网下把 WiFi 代理指向 {ip}:{port}（iOS Shadowrocket 可加规则）")
         print("    然后打开南邮小程序 → 进入场地页，等待自动捕获...")
     else:
         print(f"[*] 系统代理已开启 (127.0.0.1:{port})")
@@ -265,73 +294,113 @@ def print_instructions(mode, port):
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def recovery_path():
+    return runtime.DATA_DIR / "proxy_recovery.json"
+
+
+def _recover_proxy():
+    path = recovery_path()
+    if not path.exists():
+        return False
+    record = runtime.read_json(path)
+    if not isinstance(record, dict) or not isinstance(record.get("previous"), list) or len(record["previous"]) != 2:
+        raise RuntimeError("代理恢复文件损坏，请检查 Windows 代理设置；原文件已保留")
+    previous = tuple(record["previous"])
+    current = _read_proxy_state()
+    if current is None:
+        raise RuntimeError("无法读取当前代理，恢复记录已保留")
+    # 只有当前仍是本程序设置的代理才覆盖，保留用户/其他代理软件后续修改。
+    if current == (1, record.get("managed_proxy")):
+        _restore_proxy_state(previous)
+        print("[+] 已恢复抓取前的网络代理")
+    elif current != previous:
+        print("[*] 代理已被其他程序修改，保留当前设置")
+    path.unlink()
+    return True
+
+
+def recover_proxy():
+    with runtime.single_instance("capture"):
+        recovered = _recover_proxy()
+        if not recovered:
+            print("[*] 没有待恢复的代理记录")
+        return recovered
+
+
+def wait_proxy_ready(proc, port, timeout=8):
+    return wait_for_proxy_ready(proc, port, timeout=timeout)
+
+
 @contextmanager
-def capture_session():
-    """Only one capture process may temporarily own the user's system proxy."""
-    if os.name != "nt":
-        yield
-        return
-    import ctypes
-    from ctypes import wintypes
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
-    kernel.CreateMutexW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
-    ctypes.set_last_error(0)
-    handle = kernel.CreateMutexW(None, False, "Local\\NJUPTBadmintonTokenCapture")
-    error = ctypes.get_last_error()
-    if not handle:
-        raise CaptureError("无法创建登录获取会话")
+def proxy_session(port, env, switch_system=True, stop_event=None):
+    previous = _read_proxy_state() if switch_system else None
+    if switch_system and os.name == "nt" and previous is None:
+        raise RuntimeError("无法读取原代理状态，取消切换")
+    proc = None
+    recorded = False
     try:
-        if error == 183:  # ERROR_ALREADY_EXISTS
-            raise CaptureError("另一个窗口正在获取登录，请先取消或等待它结束")
-        yield
+        proc = spawn_mitmdump(port, env)
+        if stop_event is None:
+            wait_proxy_ready(proc, port)
+        elif not wait_for_proxy_ready(proc, port, stop_event):
+            raise runtime.Cancelled("已取消登录获取")
+        if switch_system and previous is not None:
+            token_util.atomic_write_json(recovery_path(), {
+                "previous": previous, "managed_proxy": f"127.0.0.1:{port}",
+                "owner_pid": os.getpid(),
+            })
+            recorded = True
+            set_system_proxy(True, port)
+        yield proc
     finally:
-        kernel.CloseHandle(handle)
+        try:
+            if recorded:
+                _recover_proxy()
+        finally:
+            _stop_mitmdump(proc)
 
 
-def run_refresh(cfg, timeout, force=False, stop_event=None):
-    with capture_session():
-        return _run_refresh(cfg, timeout, force=force, stop_event=stop_event)
+def run_refresh(cfg, timeout, force=False, required_until=0, *, stop_event=None):
+    with capture_session(), runtime.single_instance("capture"):
+        runtime.clear_stop("capture")
+        _recover_proxy()
+        try:
+            return _run_refresh(cfg, timeout, force, required_until, stop_event)
+        except runtime.Cancelled:
+            return 130
 
 
-def _run_refresh(cfg, timeout, force=False, stop_event=None):
+def _run_refresh(cfg, timeout, force=False, required_until=0, stop_event=None):
     tc = cfg.get("token_capture", {}) or {}
     port = find_free_port(tc.get("mitm_port", 8080))
     if port != tc.get("mitm_port", 8080):
         print(f"[!] 默认端口 {tc.get('mitm_port', 8080)} 被占用（Fiddler 可能仍在运行），改用 {port}")
 
     initial = token_util.current_best_exp()
+    initial_token = token_util.read_cached_token()
     sid = str((cfg.get("auth") or {}).get("student_id") or "")
-    initial_account_matches = not sid or token_util.cached_token_status(sid)["state"] in ("valid", "expiring")
-    if initial > 0 and initial_account_matches and not force:
+    account_matches = not sid or token_util.token_student_id(initial_token) == sid
+    if initial > max(0, required_until) and account_matches and not force:
         print("[+] 已有有效 token，无需刷新")
         return 0
 
+    phone = tc.get("mode", "pc_wechat") == "phone"
     try:
         initial_mtime_ns = token_util.TOKEN_PATH.stat().st_mtime_ns
     except FileNotFoundError:
         initial_mtime_ns = 0
-    env = {**os.environ, "NJUPT_STUDENT_ID": sid, "NJUPT_FORCE_TOKEN": "1" if force else "0"}
-    proc = None
-    prev_proxy = _read_proxy_state()
-    if os.name == "nt" and prev_proxy is None:
-        raise CaptureError("无法读取原系统代理设置，已停止获取登录；请检查当前用户权限")
-    try:
-        proc = spawn_mitmdump(port, env)
-        if not wait_for_proxy_ready(proc, port, stop_event):
-            return 130
-        set_system_proxy(True, port)
+    env = {**os.environ, "NJUPT_STUDENT_ID": sid, "NJUPT_FORCE_TOKEN": "1" if force else "0",
+           "NJUPT_LISTEN_HOST": "0.0.0.0" if phone else "127.0.0.1"}
+    with proxy_session(port, env, switch_system=not phone, stop_event=stop_event):
         print_instructions(tc.get("mode", "pc_wechat"), port)
-        tok = wait_for_token(initial, timeout, stop_event=stop_event,
-                             initial_mtime_ns=initial_mtime_ns, expected_student_id=sid)
+        tok = wait_for_token(initial, timeout, required_until, initial_token,
+                             stop_event=stop_event, initial_mtime_ns=initial_mtime_ns,
+                             expected_student_id=sid)
         if stop_event is not None and stop_event.is_set():
-            print("[*] 已取消登录获取，正在恢复代理")
             return 130
         if tok:
             exp = token_util.jwt_exp(tok)
             exp_s = datetime.fromtimestamp(exp).strftime("%H:%M:%S") if exp else "?"
-            token_util.snapshot_to_history(tok)
             print(f"[+] 新 token 已捕获并保存（有效期至今天 {exp_s}）")
             return 0
         print("[-] 超时未捕获到新 token。请检查：")
@@ -339,9 +408,6 @@ def _run_refresh(cfg, timeout, force=False, stop_event=None):
         print("    2) 若还是不行，重启电脑微信再试一次（可排除代理缓存问题）")
         print(f"    3) 运行 python capture_token.py --check 诊断；详细日志见 data/mitmdump.log")
         return 1
-    finally:
-        _stop_mitmdump(proc)
-        _restore_proxy_state(prev_proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -377,24 +443,20 @@ def probe_proxy(cfg, timeout=20):
     """起代理并真实请求南邮后端，用 mitmproxy CA 校验证书链（证明信任生效）。"""
     tc = cfg.get("token_capture", {}) or {}
     port = find_free_port(tc.get("mitm_port", 8080))
-    proc = None
-    prev = _read_proxy_state()
     ca_pem = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
     try:
-        proc = spawn_mitmdump(port, {**os.environ, "NJUPT_STUDENT_ID": ""})
-        set_system_proxy(True, port)
-        time.sleep(1.5)  # 等 mitmdump 绑定端口
-        import requests
-        proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
-        r = requests.get(
-            "https://wechat.njupt.edu.cn/mini_program/v4/venue/user/types",
-            proxies=proxies, verify=str(ca_pem), timeout=timeout)
-        return r.status_code == 200
+        with runtime.single_instance("capture"):
+            runtime.clear_stop("capture")
+            _recover_proxy()
+            with proxy_session(port, {**os.environ, "NJUPT_STUDENT_ID": ""}, switch_system=False):
+                import requests
+                proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+                r = requests.get(
+                    "https://wechat.njupt.edu.cn/mini_program/v4/venue/user/types",
+                    proxies=proxies, verify=str(ca_pem), timeout=timeout)
+                return r.status_code == 200
     except Exception:
         return False
-    finally:
-        _stop_mitmdump(proc)
-        _restore_proxy_state(prev)
 
 
 def cmd_check(cfg):
@@ -438,7 +500,6 @@ def cmd_check(cfg):
 
 
 def main(argv=None):
-    cfg = load_config()
     p = argparse.ArgumentParser(description="自动抓取并刷新预约 token")
     p.add_argument("--wait", type=int, default=None, help="等待捕获秒数（默认取配置 timeout_seconds）")
     p.add_argument("--refresh", action="store_true", help="强制刷新（即使已有有效 token）")
@@ -446,7 +507,22 @@ def main(argv=None):
     p.add_argument("--check", action="store_true", help="环境诊断")
     p.add_argument("--install-cert", action="store_true", help="安装 mitmproxy CA 到系统信任（无需管理员）")
     p.add_argument("--port", type=int, default=None, help="监听端口")
+    p.add_argument("--recover-proxy", action="store_true", help="恢复异常退出后遗留的系统代理")
+    p.add_argument("--stop", action="store_true", help="停止登录抓取并恢复代理")
+    p.add_argument("--scheduled", action="store_true", help="按预约日与今天跳过规则执行登录提醒")
     args = p.parse_args(argv)
+
+    if args.stop:
+        runtime.request_stop("capture")
+        return 0
+    if args.recover_proxy:
+        try:
+            recover_proxy()
+            return 0
+        except (RuntimeError, OSError) as e:
+            print(f"[-] {e}")
+            return 1
+    cfg = load_config()
 
     if args.check:
         return cmd_check(cfg)
@@ -467,7 +543,18 @@ def main(argv=None):
     timeout = args.wait if args.wait is not None else tc.get("timeout_seconds", 300)
     force = args.force or args.refresh
     try:
-        return run_refresh(cfg, timeout, force=force)
+        required_until = 0
+        if args.scheduled:
+            booking_cfg = cfg.get("booking") or {}
+            reason = scheduling.skip_reason(booking_cfg)
+            if reason:
+                print(f"[*] {reason}")
+                return 0
+            opts = scheduling.settings(booking_cfg)
+            required_until = scheduling.target_time(booking_cfg).timestamp() + opts["retry_window_seconds"] + opts["token_margin_seconds"]
+            if token_util.current_best_exp() <= required_until:
+                runtime.notify("请刷新预约登录", "打开电脑微信的小程序场地页，程序将自动捕获登录", cfg)
+        return run_refresh(cfg, timeout, force=force, required_until=required_until)
     except Exception as e:
         print(f"[-] 无法刷新 token: {e}")
         print("    请确认已安装 mitmproxy，或参考 README 手动抓取 token")

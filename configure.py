@@ -9,8 +9,9 @@
 需要先有有效 token（运行一次 capture_token.py 捕获后）。
 """
 
-import argparse
 import sys
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 import token_util
-from book import pre_fetch_type_id, query_slots
+from book import FALLBACK_MODES, pre_fetch_type_id, query_slots, validate_booking
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
@@ -29,50 +30,28 @@ console = Console()
 def load_config():
     if not CONFIG_PATH.exists():
         console.print(f"[red]缺少 {CONFIG_PATH}，请先运行 setup.bat 生成[/red]")
-        return None
-    try:
-        return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    except Exception as e:
-        console.print(f"[red]配置文件解析失败: {e}[/red]")
-        return None
+        sys.exit(1)
+    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 def render_config(cfg):
-    """把配置渲染成带注释的干净 YAML（只保留脚本用到的字段）。"""
-    L = []
-    L.append("# ============================")
-    L.append("# 羽毛球预约脚本配置")
-    L.append("# 由 configure.py 维护；也可手动编辑")
-    L.append("# ============================")
-    L.append("")
-    L.append("auth:")
-    L.append(f'  student_id: "{cfg.get("auth", {}).get("student_id", "")}"')
-    L.append('  cas_mode: "wecom"')
-    L.append("")
-    L.append("booking:")
-    L.append('  # 预约地点: "仙林" / "三牌楼" / 空（不限）')
-    L.append(f'  location: "{cfg.get("booking", {}).get("location", "仙林")}"')
-    L.append('  # 要抢的场次（按优先级从高到低；预约日期固定为当天）')
-    L.append("  targets:")
-    for t in cfg.get("booking", {}).get("targets", []):
-        L.append(f'    - court_name: "{t.get("court_name", "")}"')
-        L.append(f'      time: "{t.get("time", "")}"')
-    L.append(f'  schedule_time: "{cfg.get("booking", {}).get("schedule_time", "12:00")}"')
-    L.append("")
-    L.append("token_capture:")
-    tc = cfg.get("token_capture", {})
-    L.append(f'  enabled: {tc.get("enabled", True)}')
-    L.append(f'  timeout_seconds: {tc.get("timeout_seconds", 300)}')
-    L.append(f'  fallback_timeout_seconds: {tc.get("fallback_timeout_seconds", 60)}')
-    L.append(f'  mitm_port: {tc.get("mitm_port", 8080)}')
-    L.append(f'  mode: "{tc.get("mode", "pc_wechat")}"')
-    L.append(f'  refresh_time: "{tc.get("refresh_time", "11:30")}"')
-    L.append("")
-    return "\n".join(L)
+    """保留已有配置，防止丢失重试、计划、通知等设置。"""
+    cfg = {**cfg, "booking": {**(cfg.get("booking") or {})}}
+    cfg["booking"].setdefault("fallback_mode", "strict")
+    cfg["booking"]["targets"] = cfg["booking"].get("targets") or []
+    cfg["booking"]["fallback_targets"] = cfg["booking"].get("fallback_targets") or []
+    return "# 羽毛球预约配置；weekdays: 1=周一，7=周日\n" + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
 
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(render_config(cfg), encoding="utf-8")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(render_config(cfg))
+        os.replace(tmp, CONFIG_PATH)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
     console.print(f"[green]配置已保存到 {CONFIG_PATH}[/green]")
 
 
@@ -175,15 +154,28 @@ def update_basic_info(cfg):
         cfg.setdefault("auth", {})["student_id"] = new_sid
 
 
-def main():
-    parser = argparse.ArgumentParser(description="交互式预约配置向导")
-    parser.add_argument("--slots", action="store_true", help="只查看当天场地表格（不修改配置）")
-    args = parser.parse_args()
-    is_slots_only = args.slots
+def pick_fallback(filtered):
+    console.print("\n[bold]主选失败后的处理:[/bold]")
+    console.print("  1) 仅已选场次（默认）  2) 同时段换场  3) 指定备选场次")
+    choice = ask("请选择", "1")
+    modes = {"1": "strict", "2": "same_time", "3": "explicit"}
+    if choice not in modes:
+        console.print("[red]无效模式，配置未保存[/red]")
+        return None
+    mode = modes[choice]
+    backups = []
+    if mode == "explicit":
+        picks = ask("备选序号（使用上面的表格，按优先级填写）")
+        backups, _ = parse_picks(picks, filtered)
+        if not backups:
+            console.print("[red]未选择有效备选，配置未保存[/red]")
+            return None
+    return mode, backups
 
+
+def main():
     cfg = load_config()
-    if cfg is None:
-        return 1
+    is_slots_only = "--slots" in sys.argv
 
     if not is_slots_only:
         console.print("[bold]===== 预约配置向导 =====[/bold]")
@@ -217,25 +209,40 @@ def main():
     picks = console.input("[cyan]序号（逗号分隔，回车=清空目标）:[/cyan] ").strip()
     if not picks:
         new_targets = []
-        console.print("[yellow]已清空预约目标[/yellow]")
+        console.print("[yellow]已清空预约目标；预约程序将停止，不会自动选择其他场次[/yellow]")
     else:
         new_targets, dup_count = parse_picks(picks, filtered)
         if dup_count:
             console.print(f"[yellow]已忽略 {dup_count} 个重复场次[/yellow]")
         if not new_targets:
-            console.print("[yellow]未识别到有效选择[/yellow]")
+            console.print("[yellow]未识别到有效选择，配置未保存[/yellow]")
+            return 1
+
+    fallback = pick_fallback(filtered) if new_targets else ("strict", [])
+    if fallback is None:
+        return 1
 
     # 写回配置
     cfg.setdefault("booking", {})["location"] = location
     cfg["booking"]["targets"] = new_targets
+    cfg["booking"]["fallback_mode"], cfg["booking"]["fallback_targets"] = fallback
+    if new_targets:
+        try:
+            validate_booking(cfg["booking"])
+        except ValueError as e:
+            console.print(f"[red]{e}，配置未保存[/red]")
+            return 1
     save_config(cfg)
 
     console.print("\n[bold green]===== 配置完成 =====[/bold green]")
     console.print(f"  地点: [cyan]{location or '不限'}[/cyan]")
     console.print(f"  学号: [cyan]{cfg.get('auth', {}).get('student_id')}[/cyan]")
     console.print(f"  目标场次: {len(new_targets)} 个")
+    console.print(f"  顺延规则: {FALLBACK_MODES[fallback[0]]}")
     for t in new_targets:
         console.print(f"    - {t['court_name']}  {t['time']}")
+    for t in fallback[1]:
+        console.print(f"    备选: {t['court_name']}  {t['time']}")
     console.print("\n运行 [bold]python book.py --slots[/bold] 可复查，[bold]python book.py[/bold] 开始抢票")
     return 0
 

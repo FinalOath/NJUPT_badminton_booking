@@ -7,27 +7,27 @@
   python book.py --slots      # 查看可用场次
   python book.py --test       # 演练（不实际预约）
   python book.py --now        # 立即预约（不等待 12:00）
-  python book.py --refresh    # 强制重新抓取 token 后退出
-  python book.py --help       # 查看全部参数
 
 配置: config/config.yaml
 Token: data/session_cache.json（自动保存，过期可重新抓取）
 """
 
 import argparse
-import calendar
 import hashlib
+import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import yaml
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-import urllib3
-import yaml
 
 import token_util
+import runtime
+import scheduling
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -39,27 +39,16 @@ TOKEN_SALT = "4pGmY6s9zX"  # 从反编译源码提取
 
 
 def load_config():
-    """读取并解析配置；缺失/损坏时返回 None（调用方决定退出码）。"""
-    if not CONFIG_PATH.exists():
-        print(f"[!] 未找到配置文件 {CONFIG_PATH}")
-        print("    请先运行 setup.bat 或 python setup.py 生成配置")
-        return None
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-    except Exception as e:
-        print(f"[!] 配置文件解析失败: {e}")
-        print(f"    请检查 {CONFIG_PATH} 的 YAML 语法")
-        return None
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
-        print("[!] 配置文件格式错误：顶层应为键值映射")
-        return None
+        raise ValueError("配置文件必须为对象")
     return cfg
 
 
 def load_token():
-    """从缓存加载 token，自动检查 JWT 过期。"""
-    return token_util.read_cached_token(early_seconds=300)
+    """读取未过期 token；具体有效期余量由本次预约窗口统一校验。"""
+    return token_util.read_cached_token(early_seconds=0)
 
 
 def save_token(token):
@@ -84,23 +73,87 @@ BASE = "https://wechat.njupt.edu.cn/mini_program/v4"
 
 
 # 禁用 SSL 警告（南邮小程序后端使用非公开证书）
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 复用连接（keepalive）：开抢时避免重新建立 TCP+TLS 连接，单枪延迟从 ~300ms 降到 ~35ms
+# 复用连接，减少重复握手；实际延迟由运行日志测量。
 SESSION = requests.Session()
 # 抢票流量强制直连：无视系统代理/环境变量，避免代理规则把请求绕到远程节点拖慢 RTT
 SESSION.trust_env = False
+LAST_SUBMISSION_TIME = None
 
 
-def api_get(path, token, params=None, timeout=10):
-    r = SESSION.get(f"{BASE}{path}", headers={"token": token}, params=params, timeout=timeout, verify=False)
-    return r.json()
+class ApiError(RuntimeError):
+    def __init__(self, kind, message, retry_after=0):
+        super().__init__(message)
+        self.kind, self.retry_after = kind, retry_after
 
 
-def api_post(path, token, data, content_type="application/x-www-form-urlencoded", timeout=10):
-    r = SESSION.post(f"{BASE}{path}", headers={"token": token, "Content-Type": content_type},
-                     data=data, timeout=timeout, verify=False)
-    return r.json()
+def retry_after_seconds(value):
+    try:
+        return max(0, float(value))
+    except (ValueError, TypeError):
+        try:
+            return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            return 2.0
+
+
+def classify_response(resp):
+    if resp.get("success") is True:
+        return "success"
+    code = str(resp.get("errCode", ""))
+    msg = str(resp.get("errMsg") or "").lower()
+    if code == "5004" or "token" in msg and any(s in msg for s in ("失效", "过期", "错误")):
+        return "auth"
+    if any(s in msg for s in ("未支付", "超限", "已有订单", "重复预约")):
+        return "existing_order"
+    if any(s in msg for s in ("频繁", "限流", "too many")):
+        return "rate_limit"
+    if any(s in msg for s in ("已满", "满场", "被预约", "无剩余", "已被预订")) or msg == "满":
+        return "full"
+    if any(s in msg for s in ("未开放", "未开始", "尚未开始")):
+        return "not_open"
+    return "rejected"
+
+
+def _request(method, path, token, timeout=5, **kwargs):
+    global LAST_SUBMISSION_TIME
+    submitting = method == "POST"
+    try:
+        if submitting:
+            LAST_SUBMISSION_TIME = time.time()
+        r = SESSION.request(method, f"{BASE}{path}", headers={"token": token, **kwargs.pop("headers", {})},
+                            timeout=timeout, verify=False, allow_redirects=False, **kwargs)
+    except requests.RequestException as e:
+        raise ApiError("unknown" if submitting else "network", "提交结果未知，请到小程序核对订单" if submitting else "只读查询网络异常") from e
+    if r.status_code in (401, 403):
+        raise ApiError("auth", "登录失效或无权限，请重新登录")
+    if r.status_code == 429:
+        raise ApiError("rate_limit", "服务端限流", retry_after_seconds(r.headers.get("Retry-After")))
+    if not 200 <= r.status_code < 300:
+        raise ApiError("unknown" if submitting else "http", f"接口返回 HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except ValueError as e:
+        raise ApiError("unknown" if submitting else "format", "接口返回格式异常") from e
+    if not isinstance(body, dict):
+        raise ApiError("unknown" if submitting else "format", "接口响应不是对象")
+    if not submitting and classify_response(body) == "auth":
+        raise ApiError("auth", "登录已被服务端判定失效，请重新登录")
+    if not submitting and body.get("success") is False:
+        raise ApiError(classify_response(body), "只读查询被服务端拒绝，请稍后重试或到小程序查看")
+    if submitting and not isinstance(body.get("success"), bool):
+        raise ApiError("unknown", "提交响应缺少明确结果，请核对订单")
+    return body
+
+
+def api_get(path, token, params=None, timeout=5):
+    return _request("GET", path, token, params=params, timeout=timeout)
+
+
+def api_post(path, token, data, content_type="application/x-www-form-urlencoded", timeout=5):
+    return _request("POST", path, token, headers={"Content-Type": content_type}, data=data, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +230,67 @@ def match_targets(slots, cfg_targets):
 # ---------------------------------------------------------------------------
 # 预约
 # ---------------------------------------------------------------------------
+FALLBACK_MODES = {"strict": "仅已选场次", "same_time": "同时段换场", "explicit": "指定备选"}
+
+
+def validate_booking(booking):
+    """预约范围必须明确；旧配置默认严格模式，空目标不能视为全选。"""
+    mode = booking.get("fallback_mode", "strict")
+    if mode not in FALLBACK_MODES:
+        raise ValueError("fallback_mode 必须是 strict、same_time 或 explicit")
+    targets = booking.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("未设置预约目标，请运行 configure.py 选择场次；空目标不会自动预约")
+    groups = [targets]
+    if mode == "explicit":
+        backups = booking.get("fallback_targets")
+        if not isinstance(backups, list) or not backups:
+            raise ValueError("指定备选模式需要设置 fallback_targets")
+        groups.append(backups)
+    for group in groups:
+        for target in group:
+            if not isinstance(target, dict):
+                raise ValueError("场次配置必须包含完整场地名和时间段")
+            name, period = target.get("court_name"), target.get("time")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("请填写完整场地名，不支持空名称匹配所有场地")
+            if not isinstance(period, str) or not re.fullmatch(
+                r"(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d", period
+            ) or period[:5] >= period[6:]:
+                raise ValueError("场次时间必须为 HH:MM-HH:MM，且结束时间晚于开始时间")
+
+
+def build_booking_candidates(slots, booking, date, include_unavailable=False):
+    """所有查询路径共用范围规则；主选优先，备选去重且受校区和日期限制。"""
+    validate_booking(booking)
+    location = booking.get("location", "仙林")
+    eligible = [s for s in slots if s[5] == date and is_preferred_location(s[1], location)]
+    result, seen = [], set()
+
+    def add(s):
+        entry = (s[0], s[1], s[2], s[3], s[5])
+        if entry not in seen:
+            seen.add(entry)
+            result.append(entry)
+
+    def select(targets, allow_unavailable=False):
+        for target in targets:
+            for s in eligible:
+                if (s[4] or allow_unavailable) and s[1] == target["court_name"] and f"{s[2]}-{s[3]}" == target["time"]:
+                    add(s)
+
+    select(booking["targets"], include_unavailable)
+    mode = booking.get("fallback_mode", "strict")
+    if mode == "same_time":
+        for period in dict.fromkeys(t["time"] for t in booking["targets"]):
+            for s in eligible:
+                if s[4] and f"{s[2]}-{s[3]}" == period:
+                    add(s)
+    elif mode == "explicit":
+        select(booking["fallback_targets"])
+    return result
+
+
 _warned_5004 = [False]
 
 
@@ -206,377 +320,313 @@ def book(token, stadium_id, date, student_id):
 # ---------------------------------------------------------------------------
 # 服务器时间同步
 # ---------------------------------------------------------------------------
-def get_server_offset(token, samples=5):
-    """获取服务器时间与本地时间的偏移（秒）。
-
-    HTTP Date 头精度仅 1 秒，单次采样自带 0~1s 截断误差；
-    截断只会让测量值偏小，故多次采样取最大值（最接近真实，偏早几十 ms 开枪优于偏晚）。
-    """
-    offsets = []
+def get_server_offset(token, samples=3, budget_seconds=6):
+    """HTTP Date 只有秒级精度；取低 RTT 样本的中点估计，不声称毫秒对时。"""
+    samples_found = []
+    deadline = time.monotonic() + budget_seconds
     for _ in range(samples):
+        remaining = deadline - time.monotonic()
+        if remaining < 0.2:
+            break
+        runtime.check_stop()
         try:
-            t1 = time.time()
-            r = SESSION.get(f"{BASE}/venue/user/types", headers={"token": token}, timeout=5, verify=False)
-            rtt = time.time() - t1
-            date_str = r.headers.get("Date", "")
-            if date_str:
-                # HTTP Date 是 GMT，用 calendar.timegm 按 UTC 解析
-                dt = datetime.strptime(date_str[:-4], "%a, %d %b %Y %H:%M:%S")
-                server_ts = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
-                offsets.append(server_ts + rtt / 2 - t1)
-        except Exception:
+            wall = time.time()
+            started = time.monotonic()
+            # connect/read 各自限时，避免最后几秒串行长等待。
+            part = min(1.0, remaining / 2)
+            r = SESSION.get(f"{BASE}/venue/user/types", headers={"token": token},
+                            timeout=(part, part), verify=False, allow_redirects=False)
+            rtt = time.monotonic() - started
+            if r.status_code != 200 or not r.headers.get("Date"):
+                continue
+            stamp = parsedate_to_datetime(r.headers["Date"]).timestamp()
+            offset = stamp + 0.5 - (wall + rtt / 2)
+            samples_found.append((rtt, offset))
+        except (requests.RequestException, ValueError, TypeError, OverflowError):
             continue
-    if not offsets:
-        print("    [-] 无法同步服务器时间（将退化为本地时间，请确认本机时钟准确）")
+    if not samples_found:
+        print("[!] 对时不可用，使用本地时钟；本次没有服务器对时保证")
         return 0.0
-    offset = max(offsets)
-    print(f"    服务器时间偏移: {offset:+.1f}s（{len(offsets)} 次采样取最大值）")
-    # 如果本地时间不准给出告警
-    if abs(offset) > 3:
-        print(f"[!] 警告：本地时间与服务器时间差 {offset:.0f}s，已自动修正")
+    rtt, offset = min(samples_found)
+    print(f"[*] 时钟估计偏移 {offset:+.3f}s，参考不确定度至少约 ±{0.5 + rtt / 2:.3f}s")
     return offset
 
 
-# ---------------------------------------------------------------------------
-# 主逻辑
-# ---------------------------------------------------------------------------
 def wait_until_server(h, m, server_offset, advance_seconds=0, on_near=None):
-    """忙等直到服务器时间到达 h:m:00，advance_seconds 可提前触发。
-    on_near: 距目标不足 5 秒时回调一次（用于保持连接活跃，避免开抢时重建连接）。
-    """
-    target_s = (datetime.now() + timedelta(seconds=server_offset)).replace(
-        hour=h, minute=m, second=0, microsecond=0).timestamp()
-    target_s -= advance_seconds  # 提前 N 秒（用于预查场次）
-    near_fired = [False]
+    """将一次墙钟估计转换为单调时钟截止时间；等待期间不发网络请求。"""
+    target = (datetime.now() + timedelta(seconds=server_offset)).replace(
+        hour=h, minute=m, second=0, microsecond=0).timestamp() - advance_seconds
+    deadline = time.monotonic() + target - (time.time() + server_offset)
+    return wait_for_deadline(deadline)
+
+
+def wait_for_deadline(deadline):
     while True:
-        remaining = target_s - (time.time() + server_offset)
+        runtime.check_stop()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return -remaining  # 返回超时量（毫秒级精度）
-        if on_near and remaining < 5 and not near_fired[0]:
-            near_fired[0] = True
-            try:
-                on_near()
-            except Exception:
-                pass
-        if remaining > 5:
-            time.sleep(1.0)
-        elif remaining > 1:
-            time.sleep(0.1)
-        elif remaining > 0.05:
-            time.sleep(0.01)
-        # 最后 50ms 忙等（精确到 ~1ms）
+            return -remaining
+        time.sleep(min(0.2, remaining))
 
 
-def keepalive_ping(token):
-    """开抢前 5 秒发一个轻量请求，保持 Session 连接活跃（连接太旧会被服务器回收）。"""
-    try:
-        api_get("/venue/user/types", token, timeout=3)
-    except Exception:
-        pass
+def token_covers(token, required_until, student_id="", server_offset=0):
+    expiry = token_util.jwt_exp(token) or 0
+    return (expiry > required_until and expiry > time.time() + server_offset
+            and (not student_id or token_util.token_student_id(token) == student_id))
 
 
-def warm_connections(token, n=3):
-    """开抢前并发发 n 个轻量请求，让连接池养 n 条 keepalive 连接，供首枪并发复用。"""
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        for _ in range(n):
-            pool.submit(keepalive_ping, token)
+def verify_login(token):
+    data = api_get("/venue/user/types", token, timeout=3)
+    if not data.get("data") or data.get("success") is False:
+        raise ApiError("auth", "登录只读验证未通过，请重新登录")
 
 
-def _print_fire_banner(top3):
-    """打印开抢横幅（放在等待之前，避免 12:00 整点被控制台 I/O 拖慢首枪）。"""
-    print(f"\n{'='*50}")
-    print(f"[*] 开始抢购！目标: {[f'{s[1]}-{s[2]}' for s in top3]}")
-    print(f"{'='*50}")
+def guard_path():
+    return runtime.DATA_DIR / "order_guard.json"
 
 
-def _report_success(resp, name, start, end, hit_note, rtt_ms, t_shots_start, fire_delay_s, schedule_time):
-    """打印预约成功结果（顺序首枪与并发首枪共用）。"""
-    detail = resp.get("data", {}).get("detail", {})
-    total_s = time.time() - t_shots_start
-    print(f"\n[+] 预约成功！")
-    print(f"    场地: {detail.get('stadiumName', name)}")
-    print(f"    时间: {detail.get('startTime', start)}-{detail.get('endTime', end)}")
-    print(f"    金额: {detail.get('price', 8)} 元")
-    print(f"    编号: {resp.get('data', {}).get('order', {}).get('orderId', '')}")
-    print(f"[!] 请在 5 分钟内完成支付！")
-    print(f"    ── 预约耗时 ──")
-    if fire_delay_s is not None:
-        print(f"    首枪偏差: {fire_delay_s*1000:+.0f} ms（相对 {schedule_time}:00）")
-    print(f"    命中:      {hit_note}（本枪响应 {rtt_ms:.0f} ms）")
-    print(f"    总耗时:   {total_s:.2f} s（开枪 → 订单确认）")
+def acknowledge_order():
+    with runtime.single_instance("booking"):
+        guard_path().unlink(missing_ok=True)
+    print("[+] 已记录人工核对，可再次启动预约")
 
 
-def _call_with_retry(fn, tries=3, delay=1.0, what=""):
-    """开抢前的准备请求重试（网络抖动不致命；不触碰抢票热循环）。"""
-    last = None
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if i < tries - 1:
-                time.sleep(delay)
-    print(f"[-] {what}失败：重试 {tries} 次后仍报错（{last}）")
-    return None
+def save_guard(state, slot):
+    token_util.atomic_write_json(guard_path(), {
+        "state": state, "date": slot[4], "court": slot[1], "period": f"{slot[2]}-{slot[3]}",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="南邮羽毛球场地预约（自动等待到 schedule_time 精确开抢）")
-    parser.add_argument("--slots", action="store_true", help="查看可用场次后退出")
-    parser.add_argument("--test", action="store_true", help="演练模式（不实际预约）")
-    parser.add_argument("--now", action="store_true", help="立即预约（不等待 schedule_time）")
-    parser.add_argument("--refresh", action="store_true", help="强制重新抓取 token 后退出")
-    args = parser.parse_args()
-
-    cfg = load_config()
-    if cfg is None:
-        return 1
-
-    # --refresh: 强制重新抓取 token 后退出（不预约）
-    if args.refresh:
-        from capture_token import run_refresh
-        tc = cfg.get("token_capture", {}) or {}
-        return run_refresh(cfg, tc.get("timeout_seconds", 300), force=True)
-
-    token = load_token()
-    if not token:
-        # token 缺失/过期 → 尝试短时自动抓包，失败再给出手动指引
-        tc = cfg.get("token_capture", {}) or {}
-        if tc.get("enabled", True):
-            print("[*] Token 已过期或缺失，尝试自动抓取（在电脑微信打开南邮小程序即可）...")
-            try:
-                from capture_token import run_refresh
-                if run_refresh(cfg, tc.get("fallback_timeout_seconds", 60), force=False) == 0:
-                    token = load_token()
-            except Exception as e:
-                # 未安装 mitmproxy 等环境问题：不应崩溃，给出手动指引
-                print(f"[-] 自动抓取不可用: {e}")
-        if not token:
-            print("[-] 无有效 token。请运行: python capture_token.py --wait 300")
-            print("    （在电脑微信打开南邮小程序 → 进入场地页，捕获后自动保存）")
+def run_attempts(token, ranked, student_id, cfg, fire_epoch=None, server_offset=0):
+    global LAST_SUBMISSION_TIME
+    opts = scheduling.settings(cfg.get("booking") or {})
+    start = time.monotonic()
+    deadline = start + opts["retry_window_seconds"]
+    remaining_slots = list(ranked)
+    index = 0
+    throttles = 0
+    first_sent_at = None
+    for attempt in range(opts["max_attempts"]):
+        runtime.check_stop()
+        remaining = deadline - time.monotonic()
+        if remaining < 5:
+            break  # 留出单次请求的超时预算，不在截止边缘启动新提交。
+        if not remaining_slots:
+            runtime.report("full", "[-] 允许范围内的候选均已返回满场")
             return 1
-
-    student_id = cfg.get("auth", {}).get("student_id", "")
-    targets = cfg.get("booking", {}).get("targets", [])
-    schedule_time = cfg.get("booking", {}).get("schedule_time", "12:00")
-    location = cfg.get("booking", {}).get("location", "仙林")  # 仙林/三牌楼/空=不限
-
-    is_test = args.test
-    is_now = args.now
-    is_slots = args.slots
-
-    # 预约日期固定为当天
-    target_date = datetime.now().strftime("%Y-%m-%d")
-
-    # 校验 schedule_time 格式（HH:MM），避免配置手误导致崩溃
-    try:
-        h, m = map(int, str(schedule_time).split(":"))
-    except ValueError:
-        print(f"[!] booking.schedule_time 格式错误: {schedule_time!r}（应为 HH:MM，如 12:00）")
-        return 1
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        print(f"[!] booking.schedule_time 超出范围: {schedule_time!r}")
-        return 1
-
-    fire_delay_s = None  # 首枪偏差（--now 模式无等待，保持 None）
-
-    # ===== 1. 预拉取 + 时间同步 =====
-    print("[*] 预拉取运动类型...")
-    type_id = _call_with_retry(lambda: pre_fetch_type_id(token), what="预拉取运动类型")
-    if not type_id:
-        return 1
-
-    print("[*] 同步服务器时间...")
-    server_offset = get_server_offset(token)
-
-    # ===== 2. 提前查场次（获取场地 ID 映射）=====
-    print(f"[*] 预查场次: {target_date}")
-    slots = _call_with_retry(lambda: query_slots(token, target_date, type_id), what="预查场次")
-    if slots is None:
-        return 1
-    slot_map = {}   # (court_name, start, end) -> stadium_id
-    for sid, name, start, end, status, date in slots:
-        if is_preferred_location(name, location):
-            slot_map[(name, start, end)] = sid
-
-    # 同时构建顺延池：所有可用场次
-    expand_pool = [(s[0], s[1], s[2], s[3], s[5])
-                   for s in slots if s[4] and is_preferred_location(s[1], location)]
-
-    # 如果是 --slots，显示后退出
-    if is_slots:
-        avail = [s for s in slots if s[4] and is_preferred_location(s[1], location)]
-        loc_txt = f"（{location}）" if location else "（不限地点）"
-        print(f"\n  可预约 ({len(avail)} 个{loc_txt}):")
-        # 按时间段分组展示
-        groups = {}
-        for _sid, name, start, end, _status, _date in avail:
-            groups.setdefault(f"{start}-{end}", []).append(name)
-        n = 0
-        for period in sorted(groups):
-            print(f"\n  【{period}】")
-            for name in groups[period]:
-                n += 1
-                print(f"    {n}. {name}")
-        return 0
-
-    # 若有 slot_map，直接从目标生成抢购列表（不依赖 status，到点直接抢）
-    if slot_map and targets:
-        direct_targets = []
-        for tgt in targets:
-            key = (tgt["court_name"], *tgt["time"].split("-"))
-            sid = slot_map.get(key)
-            if sid:
-                entry = (sid, tgt["court_name"], key[1], key[2], target_date)
-                if entry not in direct_targets:
-                    direct_targets.append(entry)
-        if direct_targets:
-            ranked = direct_targets
-            print(f"[*] 预加载目标 ({len(ranked)} 个):")
-            for sid, name, start, end, date in ranked:
-                print(f"    [{sid}] {name}  {start}-{end}")
-        else:
-            print("[!] 预加载未匹配到目标，将在 12:00 实时查询")
-            ranked = []
-    else:
-        ranked = []
-
-    # ===== 3. 等待 + 抢购 =====
-    if is_now:
-        pass
-    elif not ranked:
-        # 无预加载目标 → 提前 2 秒查场次，然后卡 12:00
-        wait_until_server(h, m, server_offset, advance_seconds=2.0,
-                          on_near=lambda: warm_connections(token))
-    else:
-        # 有预加载目标 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00:00.000
-        _print_fire_banner(ranked[:3])
-        wait_until_server(h, m, server_offset, advance_seconds=6.0)
-        server_offset = get_server_offset(token)
-        fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                                         on_near=lambda: warm_connections(token))
-
-    # 如果没有预加载到目标，现在查（等待已结束或即将结束）
-    if not ranked:
-        print(f"[*] 查询场次: {target_date}")
-        slots = query_slots(token, target_date, type_id)
-        ranked = match_targets(slots, targets) if targets else [
-            (s[0], s[1], s[2], s[3], s[5]) for s in slots if s[4] and is_preferred_location(s[1], location)
-        ]
-        # 也构建顺延池
-        expand_pool = [(s[0], s[1], s[2], s[3], s[5])
-                       for s in slots if s[4] and is_preferred_location(s[1], location)]
-        if not ranked:
-            print("[-] 无可用场次")
+        slot = remaining_slots[index % len(remaining_slots)]
+        sid, name, begin, end, date = slot
+        if not token_covers(token, time.time() + server_offset + 10, student_id, server_offset):
+            runtime.report("auth", "[-] 登录有效期不足，停止提交并请重新登录")
             return 1
-        print(f"[*] 目标场次 ({len(ranked)} 个):")
-        for sid, name, start, end, date in ranked[:5]:
-            print(f"    [{sid}] {name}  {start}-{end}")
-        # 还有时间剩余 → 先等到 T-6s 二次校验时间偏移，再精确卡 12:00（仅非 --now 模式）
-        if not is_now:
-            _print_fire_banner(ranked[:3])
-            wait_until_server(h, m, server_offset, advance_seconds=6.0)
-            server_offset = get_server_offset(token)
-            fire_delay_s = wait_until_server(h, m, server_offset, advance_seconds=0.0,
-                                             on_near=lambda: warm_connections(token))
-
-    if is_test:
-        print("[*] 演练模式，未实际预约")
-        return 0
-
-    # ===== 4. 开始抢购 =====
-    top3 = ranked[:3]
-    t_shots_start = time.time()  # 开枪计时起点（首枪发出时刻）
-
-    if is_now:
-        _print_fire_banner(top3)
-
-    # 首枪并发：12:00 一到同时打 top3，任一成功即停（命中第 2/3 目标的时间压到接近单枪 RTT）
-    # 注意：若多个目标同时可订，服务端可能同时成交多单——与顺序版"只订最高优先"不同，需留意
-    if len(top3) > 1:
-        pool = None
+        # 必须先写待核对标记：进程被杀时，下一次启动不会盲目重复提交。
+        save_guard("submitting", slot)
+        sent_at = time.time()
+        LAST_SUBMISSION_TIME = None
         try:
-            pool = ThreadPoolExecutor(max_workers=len(top3))
-            futures = {pool.submit(book, token, s[0], s[4], student_id): s for s in top3}
-            over_limit = False
-            for fut in as_completed(futures):
-                sid, name, start, end, date = futures[fut]
-                try:
-                    ok, resp, rtt_ms = fut.result()
-                except Exception as e:
-                    print(f"    # 并发首枪 {name} {start}-{end}: 网络异常（{e}）")
-                    continue
-                if ok:
-                    _report_success(resp, name, start, end, "并发首枪", rtt_ms,
-                                    t_shots_start, fire_delay_s, schedule_time)
-                    return 0
-                err = resp.get("errMsg", "")
-                if "超限" in err:
-                    over_limit = True
-            if over_limit:
-                print(f"[-] 预约超限（已有未支付的订单），先取消旧订单")
-                return 1
-        except Exception as e:
-            print(f"    [!] 并发首枪异常，退回顺序抢购（{e}）")
-        finally:
-            if pool is not None:
-                pool.shutdown(wait=False, cancel_futures=True)
-
-    for attempt in range(200):
-        now = datetime.now()
-        phase = "high" if (now.hour == h and now.minute == m and now.second < 2) else "normal"
-
-        # 顺延：偏好场次尝试一轮后仍失败 → 扩大到所有仙林可用场次
-        if attempt >= len(top3) and expand_pool and len(ranked) < len(expand_pool):
-            new_count = 0
-            for entry in expand_pool:
-                if entry not in ranked:
-                    ranked.append(entry)
-                    new_count += 1
-            if new_count > 0:
-                top3 = ranked[:3]
-                print(f"    [+] 顺延至所有仙林场次（共 {len(ranked)} 个目标）")
-
-        if phase == "high":
-            slot = top3[(attempt) % len(top3)]
-        else:
-            slot = ranked[attempt % len(ranked)]
-
-        sid, name, start, end, date = slot
-        try:
-            ok, resp, rtt_ms = book(token, sid, date, student_id)
-        except Exception as e:
-            # 网络抖动/后端异常时退避重试，避免整场抢票因单枪异常而崩溃
-            if phase != "high" and attempt % 10 == 0:
-                print(f"    # 尝试 {attempt+1}: 网络异常（{e}），0.5s 后重试")
-            time.sleep(0.5)
-            continue
-
-        if ok:
-            _report_success(resp, name, start, end, f"第 {attempt+1} 枪", rtt_ms,
-                            t_shots_start, fire_delay_s, schedule_time)
+            ok, resp, rtt = book(token, sid, date, student_id)
+            kind = "success" if ok else classify_response(resp)
+            retry_after = 0
+        except ApiError as e:
+            kind, retry_after = e.kind, e.retry_after
+            rtt, resp = None, {}
+        if first_sent_at is None:
+            first_sent_at = LAST_SUBMISSION_TIME or sent_at
+        deviation_ms = (first_sent_at + server_offset - fire_epoch) * 1000 if fire_epoch else None
+        if kind == "unknown":
+            save_guard("unknown", slot)
+            runtime.report("unknown", "[!] 提交结果未知，已暂停。请到小程序核对订单，确认后解除暂停",
+                           attempt=attempt + 1)
+            runtime.notify("预约结果待核对", "网络或响应异常，请到小程序核对订单；程序已停止重试", cfg)
+            return 2
+        if kind == "success":
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+            order = data.get("order") if isinstance(data.get("order"), dict) else {}
+            summary = {"court": detail.get("stadiumName", name), "date": date,
+                       "start": detail.get("startTime", begin), "end": detail.get("endTime", end),
+                       "price": detail.get("price"), "order_id": order.get("orderId"),
+                       "created_at": datetime.now().isoformat(timespec="seconds")}
+            save_guard("success", slot)
+            try:
+                token_util.atomic_write_json(runtime.DATA_DIR / "last_order.json", summary)
+            except OSError:
+                print("[!] 订单摘要保存失败，请到小程序查看")
+            runtime.report("success", f"[+] 预约成功：{summary['court']} {summary['start']}-{summary['end']}。请立即到小程序核对并支付（以页面倒计时为准）",
+                           attempt=attempt + 1, rtt_ms=rtt, estimated_first_send_deviation_ms=deviation_ms,
+                           elapsed_seconds=round(time.monotonic() - start, 3))
+            runtime.notify("预约成功，待支付", f"{name} {begin}-{end}，请立即到小程序支付", cfg)
             return 0
-
-        err = resp.get("errMsg", "")
-        if "超限" in err:
-            print(f"[-] 预约超限（已有未支付的订单），先取消旧订单")
+        if kind == "existing_order":
+            save_guard("existing_order", slot)
+            runtime.report(kind, "[-] 已有订单或预约超限，停止；请到小程序核对")
             return 1
-
-        if attempt > 50 and phase == "normal":
-            time.sleep(2.0)
-
-        if phase != "high" and attempt % 10 == 0:
-            print(f"    # 尝试 {attempt+1}: {name} {start}-{end} -> {err or '失败'}")
-
-    print("[-] 抢购失败，所有场次均已满")
-    print(f"    共尝试 200 枪，总耗时 {time.time()-t_shots_start:.1f} s")
+        guard_path().unlink(missing_ok=True)  # 仅在收到明确未成功响应后清除。
+        if kind in ("auth", "rejected"):
+            runtime.report(kind, "[-] 登录失效，请重新登录" if kind == "auth" else "[-] 服务端拒绝预约，已停止；请在小程序查看原因",
+                           error_code=str(resp.get("errCode", ""))[:40])
+            return 1
+        if kind == "full":
+            remaining_slots.remove(slot)
+        elif kind == "rate_limit":
+            throttles += 1
+        else:
+            index += 1
+        runtime.report("retrying", f"[*] 第 {attempt + 1} 次：{'满场，切换候选' if kind == 'full' else '限流，等待' if kind == 'rate_limit' else '尚未开放，等待'}",
+                       attempt=attempt + 1, rtt_ms=rtt)
+        delay = max(retry_after, min(2 ** throttles, 30)) if kind == "rate_limit" else opts["retry_interval_seconds"]
+        if time.monotonic() + delay >= deadline:
+            break
+        runtime.pause(delay)
+    runtime.report("exhausted", "[-] 已达到本次尝试次数或时间上限，预约未成功")
     return 1
 
 
-if __name__ == "__main__":
+def _main(args):
+    cfg = load_config()
+    if "--refresh" in args:
+        from capture_token import run_refresh
+        tc = cfg.get("token_capture") or {}
+        return run_refresh(cfg, tc.get("timeout_seconds", 300), force=True)
+    booking_cfg = cfg.get("booking") or {}
+    is_slots, is_test, is_now = "--slots" in args, "--test" in args, "--now" in args
+    if not is_slots:
+        validate_booking(booking_cfg)
+    opts = scheduling.settings(booking_cfg)
+    if not is_slots and not is_test:
+        reason = scheduling.skip_reason(booking_cfg, immediate=is_now)
+        if reason:
+            runtime.report("skipped", f"[*] {reason}")
+            return 0
+        if guard_path().exists():
+            runtime.report("blocked", "[!] 上次提交需要核对。请到小程序查看订单，确认后执行 --acknowledge-order 或在窗口解除暂停")
+            return 2
+    planned = scheduling.target_time(booking_cfg).timestamp()
+    required_until = (time.time() if is_now or is_slots or is_test else max(time.time(), planned)) + opts["retry_window_seconds"] + opts["token_margin_seconds"]
+    student_id = str((cfg.get("auth") or {}).get("student_id") or "")
+    token = load_token()
+    if not token_covers(token, required_until, student_id):
+        tc = cfg.get("token_capture") or {}
+        runtime.report("auth", "[!] 登录缺失、账号不符或有效期无法覆盖本次预约，请打开电脑微信的小程序场地页")
+        runtime.notify("需要刷新登录", "请打开电脑微信的小程序场地页，刷新后继续预约", cfg)
+        if tc.get("enabled", True):
+            runtime.check_stop()
+            from capture_token import run_refresh
+            if run_refresh(cfg, tc.get("fallback_timeout_seconds", 60), force=True, required_until=required_until) == 0:
+                token = load_token()
+        if not token_covers(token, required_until, student_id):
+            runtime.report("auth", "[-] 登录未就绪，停止预约")
+            return 1
+    expiry = datetime.fromtimestamp(token_util.jwt_exp(token)).strftime("%m-%d %H:%M:%S")
+    print(f"[*] 登录有效至 {expiry}")
+    type_id = pre_fetch_type_id(token)
+    if not type_id:
+        runtime.report("auth", "[-] 无法读取运动类型，请核对登录")
+        return 1
+    date = datetime.now().strftime("%Y-%m-%d")
+    slots = query_slots(token, date, type_id)
+    if is_slots:
+        for sid, name, begin, end, available, day in slots:
+            if day == date and available and is_preferred_location(name, booking_cfg.get("location", "仙林")):
+                print(f"{name} {begin}-{end}")
+        return 0
+    ranked = build_booking_candidates(slots, booking_cfg, date, include_unavailable=not is_now)
+    if is_now and not ranked:
+        ranked = build_booking_candidates(query_slots(token, date, type_id), booking_cfg, date)
+    if is_test:
+        print(f"[*] 预约范围：{FALLBACK_MODES[booking_cfg.get('fallback_mode', 'strict')]}")
+        for _, name, begin, end, _ in ranked:
+            print(f"    {name} {begin}-{end}")
+        print("[*] 演练完成，未提交预约")
+        return 0
+    offset = get_server_offset(token)
+    h, m = map(int, opts["schedule_time"].split(":"))
+    if not is_now:
+        runtime.report("waiting", f"[*] 等待 {opts['schedule_time']}，最后 30 秒完成登录和场次检查")
+        wait_until_server(h, m, offset, advance_seconds=30)
+        runtime.check_stop()
+        # 有足够预算才做最后的只读校验；最后几秒不再校准/查询。
+        if planned - (time.time() + offset) >= 12:
+            fresh = load_token()
+            required_until = planned + opts["retry_window_seconds"] + opts["token_margin_seconds"]
+            if not token_covers(fresh, required_until, student_id, offset):
+                runtime.report("auth", "[-] 开抢前登录有效期不足，请刷新登录")
+                runtime.notify("需要重新登录", "本次预约已停止，请刷新登录", cfg)
+                return 1
+            token = fresh
+            verify_login(token)
+            slots = query_slots(token, date, type_id)
+            ranked = build_booking_candidates(slots, booking_cfg, date, include_unavailable=True)
+        if time.time() + offset > planned + opts["late_grace_seconds"]:
+            runtime.report("skipped", "[-] 准备阶段已错过开抢窗口，停止")
+            return 1
+        wait_until_server(h, m, offset)
+    else:
+        verify_login(token)
+    if not ranked:
+        runtime.report("empty", "[-] 所选范围内无可预约候选")
+        return 1
+    # 等待期间的日期切换、今天跳过等改动也必须生效。
+    if datetime.now().strftime("%Y-%m-%d") != date:
+        runtime.report("skipped", "[-] 日期已变化，请重新启动")
+        return 1
+    reason = scheduling.skip_reason(booking_cfg, immediate=is_now)
+    if reason:
+        runtime.report("skipped", f"[*] {reason}")
+        return 0
+    return run_attempts(token, ranked, student_id, cfg, None if is_now else planned, offset)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="?????????")
+    for flag, help_text in [
+        ("slots", "?????????"), ("test", "????"),
+        ("now", "????"), ("refresh", "?????????"),
+        ("stop", "?????????"), ("skip-today", "???????"),
+        ("acknowledge-order", "?????????"),
+    ]:
+        parser.add_argument("--" + flag, action="store_true", help=help_text)
+    parsed = parser.parse_args()
+    args = {"--" + name.replace("_", "-") for name, enabled in vars(parsed).items() if enabled}
+    if "--stop" in args:
+        runtime.request_stop("booking")
+        runtime.request_stop("capture")
+        print("[*] 已请求停止，正在发送的请求会先返回结果")
+        return 0
+    if "--skip-today" in args:
+        scheduling.set_skip_today()
+        runtime.request_stop("booking")
+        return 0
     try:
-        sys.exit(main())
+        if "--acknowledge-order" in args:
+            acknowledge_order()
+            return 0
+        with runtime.single_instance("booking"):
+            runtime.clear_stop("booking")
+            from capture_token import recovery_path, recover_proxy
+            if recovery_path().exists() and not runtime.is_running("capture"):
+                recover_proxy()
+            return _main(args)
+    except runtime.AlreadyRunning as e:
+        print(f"[-] {e}")
+        return 1
+    except runtime.Cancelled as e:
+        runtime.report("stopped", str(e))
+        return 1
     except KeyboardInterrupt:
-        print("\n[!] 已取消")
-        sys.exit(130)
+        runtime.report("stopped", "[*] 已停止，请在小程序核对可能已发送的预约")
+        return 1
+    except ApiError as e:
+        runtime.report(e.kind, f"[-] {e}")
+        return 1
+    except RuntimeError as e:
+        runtime.report("error", f"[-] {e}")
+        return 1
+    except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as e:
+        runtime.report("error", f"[-] 配置或运行错误（{type(e).__name__}），请检查配置和本地文件")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

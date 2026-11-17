@@ -45,6 +45,22 @@ class TestParsePicks:
 
 
 class TestRenderConfig:
+    def test_scope_roundtrip(self):
+        booking = {
+            "targets": [{"court_name": "仙林1号", "time": "18:00-19:00"}],
+            "fallback_mode": "explicit",
+            "fallback_targets": [{"court_name": "仙林2号", "time": "19:00-20:00"}],
+        }
+        saved = yaml.safe_load(configure.render_config({"booking": booking}))["booking"]
+        for key, value in booking.items():
+            assert saved[key] == value
+
+    def test_empty_targets_remain_list(self):
+        saved = yaml.safe_load(configure.render_config({"booking": {"targets": []}}))["booking"]
+        assert saved["targets"] == []
+        assert saved["fallback_mode"] == "strict"
+        assert saved["fallback_targets"] == []
+
     def test_no_date_fields(self):
         text = configure.render_config({
             "auth": {"student_id": "B21000001"},

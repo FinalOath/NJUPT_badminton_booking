@@ -1,29 +1,36 @@
-# ============================
-# 配置说明（与 config.yaml.template 对应）
-# 首次使用建议直接运行 setup.bat / setup.py 自动生成 config.yaml
-# ============================
-
 auth:
-  # 你的学号（南邮统一身份认证账号），用于预约签名
-  student_id: "B21000000"
-  cas_mode: "wecom"
-
+  student_id: B21000000
+  cas_mode: wecom
 token_capture:
-  # 自动抓包刷新 token 配置
-  enabled: true              # book.py 在 token 过期时自动短时抓包
-  timeout_seconds: 300       # 独立刷新等待秒数
-  fallback_timeout_seconds: 60   # book.py 内兜底抓包等待秒数
-  mitm_port: 8080            # 抓包代理端口
-  mode: pc_wechat            # pc_wechat（电脑微信）| phone（手机+Shadowrocket）
-  refresh_time: "11:30"      # 每日刷新计划任务时间
-
+  enabled: true
+  timeout_seconds: 300
+  fallback_timeout_seconds: 60
+  mitm_port: 8080
+  mode: pc_wechat
+  refresh_time: '11:30'
 booking:
-  # 预约地点: "仙林" / "三牌楼" / 空（不限）
-  location: "仙林"
-  # 要抢的场次（按优先级从高到低）
-  # court_name 需与小程序里的场地名称一致；time 格式 "HH:MM-HH:MM"
+  location: 仙林
+  fallback_mode: strict
+  fallback_targets: []
   targets:
-    - court_name: "仙林体育馆主馆1F羽毛球1号场地"
-      time: "16:00-17:00"
-  # 每天开放抢购时间（预约日期固定为当天）
-  schedule_time: "12:00"
+  - court_name: 仙林体育馆主馆1F羽毛球1号场地
+    time: 16:00-17:00
+  schedule_time: '12:00'
+  weekdays:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  prepare_minutes: 5
+  refresh_minutes: 30
+  late_grace_seconds: 60
+  max_attempts: 30
+  retry_window_seconds: 60
+  retry_interval_seconds: 0.5
+  token_margin_seconds: 120
+notify:
+  enable_desktop: true
+  enable_sound: true

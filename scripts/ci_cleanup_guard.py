@@ -6,8 +6,8 @@ CI 代码清理回归护栏（纯标准库，无第三方依赖）。
   任务1  删除死文件 scripts/install_task.bat；uninstall_task.bat 删除两个计划任务；
          allow_mitm.bat 不再停用防火墙服务 MpsSvc。
   任务2  MITM 收窄到南邮域名（capture_token.py 含 --allow-hosts / MITM_ALLOW_HOST）。
-  任务3  book.py 抢票热循环含 0.5s 退避重试。
-  任务4  删除死依赖 plyer，以及死配置 password/api/notify/base_url/desktop/console。
+  任务3  book.py 抢票热循环通过 runtime.pause 使用默认 0.5s 退避重试。
+  任务4  删除基础依赖 plyer 及死配置 password/api/base_url/console，校验通知消费方。
   额外   make_dist.py 分发包必须包含 uninstall_task.bat（文档引用了它）。
 
 用法:
@@ -52,10 +52,13 @@ def main():
     if "--allow-hosts" not in capture or "MITM_ALLOW_HOST" not in capture:
         errors.append("capture_token.py 缺少 --allow-hosts / MITM_ALLOW_HOST（MITM 未收窄）")
 
-    # 任务3：book.py 抢票热循环退避重试（0.5s 退避为唯一标记）
+    # 任务3：可取消的重试等待，共用计划参数中的默认 0.5s 间隔。
     book = (ROOT / "book.py").read_text(encoding="utf-8")
-    if "time.sleep(0.5)" not in book:
-        errors.append("book.py 抢票循环缺少 0.5s 退避重试")
+    scheduling = (ROOT / "scheduling.py").read_text(encoding="utf-8")
+    if 'runtime.pause(delay)' not in book or 'opts["retry_interval_seconds"]' not in book:
+        errors.append("book.py 抢票循环缺少可取消的退避重试")
+    if 'number("retry_interval_seconds", 0.5,' not in scheduling:
+        errors.append("scheduling.py 缺少默认 0.5s 重试间隔")
 
     # 任务4：死依赖/死配置清理
     req = (ROOT / "requirements.txt").read_text(encoding="utf-8")
@@ -64,9 +67,13 @@ def main():
 
     for fname in ("config/config.yaml.template", "config/config.schema.yaml"):
         text = (ROOT / fname).read_text(encoding="utf-8")
-        for dead in ("password:", "api:", "notify:", "base_url", "enable_desktop", "enable_console"):
+        for dead in ("password:", "api:", "base_url", "enable_console"):
             if dead in text:
                 errors.append(f"{fname} 仍含死配置字段 {dead!r}")
+
+    runtime = (ROOT / "runtime.py").read_text(encoding="utf-8")
+    if '.get("notify")' not in runtime or 'opts.get("enable_desktop"' not in runtime:
+        errors.append("通知配置缺少 runtime.py 消费方")
 
     # 正向校验：仍被 configure.py 读取的字段不能被误删
     for fname in ("config/config.yaml.template", "config/config.schema.yaml"):

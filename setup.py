@@ -57,7 +57,7 @@ def ensure_config():
     else:
         print(f"[OK] 学号已配置: {sid}")
 
-    print("[*] 如需调整预约目标（场地/时间段），请编辑 config/config.yaml 的 booking.targets")
+    print("[*] 刷新登录后请运行 configure.py 选择预约场次；空目标不会预约")
     return True
 
 
@@ -89,13 +89,13 @@ def install_cert():
 
 
 def setup_scheduled_tasks():
-    if not ask("是否注册每日计划任务（11:30 刷新 token + 11:55 抢票）？[y/N]", "n").lower() in ("y", "yes"):
+    if not ask("是否按配置注册计划任务（登录提醒 + 预约准备）？[y/N]", "n").lower() in ("y", "yes"):
         print("[*] 跳过计划任务。可稍后运行: scripts\\install_task.ps1")
         return
     ps = BASE_DIR / "scripts" / "install_task.ps1"
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps)],
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), "-PythonPath", sys.executable],
             capture_output=True, text=True, timeout=60)
         print(r.stdout)
         if r.returncode != 0:
