@@ -16,6 +16,7 @@
 """
 
 import argparse
+from contextlib import contextmanager
 import os
 import socket
 import subprocess
@@ -43,10 +44,19 @@ MITM_ALLOW_HOST = r"^wechat\.njupt\.edu\.cn$"
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 
+class CaptureError(RuntimeError):
+    """An actionable public message which contains no captured credentials."""
+
+
 # ---------------------------------------------------------------------------
 # 环境探测
 # ---------------------------------------------------------------------------
 def find_mitmdump():
+    # GUI portable builds include the library in this interpreter, including
+    # when launched through pythonw.exe. Never execute a .bat through a shell.
+    import importlib.util
+    if importlib.util.find_spec("mitmproxy") is not None:
+        return sys.executable
     # 1. 打包内置的便携版（dist/mitmproxy/bin/）
     bundled = BASE_DIR / "mitmproxy" / "bin"
     for name in ("mitmdump.exe", "mitmdump"):
@@ -146,8 +156,7 @@ def _restore_proxy_state(state):
     enable, server = state
     key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _INTERNET_SETTINGS)
     winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, int(enable) if enable else 0)
-    if server:
-        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, server)
+    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, server)
     winreg.CloseKey(key)
     _internet_set_option()
 
@@ -161,11 +170,16 @@ def spawn_mitmdump(port, env):
         raise RuntimeError("未找到 mitmdump，请先安装 mitmproxy")
     log_path = BASE_DIR / "data" / "mitmdump.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [exe, "--listen-port", str(port), "--ssl-insecure",
-           "--allow-hosts", MITM_ALLOW_HOST, "-s", str(ADDON_PATH)]
+    args = ["--listen-port", str(port), "--ssl-insecure",
+            "--allow-hosts", MITM_ALLOW_HOST, "-s", str(ADDON_PATH)]
+    if exe == sys.executable:
+        cmd = [exe, "-c", "from mitmproxy.tools.main import mitmdump; mitmdump()"] + args
+    else:
+        cmd = [exe] + args
     logf = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         proc._logf = logf
         return proc
     except Exception:
@@ -190,22 +204,49 @@ def _stop_mitmdump(proc):
         pass
 
 
+def wait_for_proxy_ready(proc, port, stop_event=None, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if proc.poll() is not None:
+            raise CaptureError("抓包组件启动失败，请检查 data/mitmdump.log")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    raise CaptureError("抓包组件未就绪，请检查 data/mitmdump.log")
+
+
 # ---------------------------------------------------------------------------
 # 等待捕获
 # ---------------------------------------------------------------------------
-def wait_for_token(initial_exp, timeout):
+def wait_for_token(initial_exp, timeout, stop_event=None, initial_mtime_ns=None,
+                   expected_student_id=""):
     """轮询缓存：出现 exp 高于 initial_exp 的新 token 即返回。"""
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_report = 0.0
-    while time.time() < deadline:
-        cur = token_util.current_best_exp()
-        if cur > initial_exp:
-            return token_util.read_cached_token()
-        now = time.time()
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return ""
+        tok = token_util.read_cached_token()
+        cur = token_util.jwt_exp(tok) or 0
+        try:
+            observed = (initial_mtime_ns is not None and
+                        token_util.TOKEN_PATH.stat().st_mtime_ns != initial_mtime_ns)
+        except FileNotFoundError:
+            observed = False
+        if tok and (not expected_student_id or token_util.token_student_id(tok) == expected_student_id) and (cur > initial_exp or observed):
+            return tok
+        now = time.monotonic()
         if now - last_report >= 10:
             last_report = now
             print(f"    ... 等待捕获中（还剩 {int(deadline - now)}s）请在微信里打开南邮小程序并进入场地页")
-        time.sleep(1)
+        if stop_event is None:
+            time.sleep(1)
+        else:
+            stop_event.wait(1)
     return ""
 
 
@@ -224,26 +265,69 @@ def print_instructions(mode, port):
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-def run_refresh(cfg, timeout, force=False):
+@contextmanager
+def capture_session():
+    """Only one capture process may temporarily own the user's system proxy."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    ctypes.set_last_error(0)
+    handle = kernel.CreateMutexW(None, False, "Local\\NJUPTBadmintonTokenCapture")
+    error = ctypes.get_last_error()
+    if not handle:
+        raise CaptureError("无法创建登录获取会话")
+    try:
+        if error == 183:  # ERROR_ALREADY_EXISTS
+            raise CaptureError("另一个窗口正在获取登录，请先取消或等待它结束")
+        yield
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def run_refresh(cfg, timeout, force=False, stop_event=None):
+    with capture_session():
+        return _run_refresh(cfg, timeout, force=force, stop_event=stop_event)
+
+
+def _run_refresh(cfg, timeout, force=False, stop_event=None):
     tc = cfg.get("token_capture", {}) or {}
     port = find_free_port(tc.get("mitm_port", 8080))
     if port != tc.get("mitm_port", 8080):
         print(f"[!] 默认端口 {tc.get('mitm_port', 8080)} 被占用（Fiddler 可能仍在运行），改用 {port}")
 
     initial = token_util.current_best_exp()
-    if initial > 0 and not force:
+    sid = str((cfg.get("auth") or {}).get("student_id") or "")
+    initial_account_matches = not sid or token_util.cached_token_status(sid)["state"] in ("valid", "expiring")
+    if initial > 0 and initial_account_matches and not force:
         print("[+] 已有有效 token，无需刷新")
         return 0
 
-    sid = cfg.get("auth", {}).get("student_id", "")
-    env = {**os.environ, "NJUPT_STUDENT_ID": sid}
+    try:
+        initial_mtime_ns = token_util.TOKEN_PATH.stat().st_mtime_ns
+    except FileNotFoundError:
+        initial_mtime_ns = 0
+    env = {**os.environ, "NJUPT_STUDENT_ID": sid, "NJUPT_FORCE_TOKEN": "1" if force else "0"}
     proc = None
     prev_proxy = _read_proxy_state()
+    if os.name == "nt" and prev_proxy is None:
+        raise CaptureError("无法读取原系统代理设置，已停止获取登录；请检查当前用户权限")
     try:
         proc = spawn_mitmdump(port, env)
+        if not wait_for_proxy_ready(proc, port, stop_event):
+            return 130
         set_system_proxy(True, port)
         print_instructions(tc.get("mode", "pc_wechat"), port)
-        tok = wait_for_token(initial, timeout)
+        tok = wait_for_token(initial, timeout, stop_event=stop_event,
+                             initial_mtime_ns=initial_mtime_ns, expected_student_id=sid)
+        if stop_event is not None and stop_event.is_set():
+            print("[*] 已取消登录获取，正在恢复代理")
+            return 130
         if tok:
             exp = token_util.jwt_exp(tok)
             exp_s = datetime.fromtimestamp(exp).strftime("%H:%M:%S") if exp else "?"
@@ -265,11 +349,9 @@ def run_refresh(cfg, timeout, force=False):
 # ---------------------------------------------------------------------------
 def ca_is_trusted():
     """检查 mitmproxy CA 是否在 Windows 用户信任存储中。"""
-    import subprocess
     try:
-        r = subprocess.run(["certutil", "-user", "-store", "Root"],
-                           capture_output=True, text=True, timeout=15)
-        return "mitmproxy" in r.stdout.lower()
+        from certificate_manager import is_trusted
+        return is_trusted()
     except Exception:
         return False
 

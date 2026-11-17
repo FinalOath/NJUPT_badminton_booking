@@ -20,7 +20,8 @@ MITM_SOURCES = [Path("D:/Program Files/mitmproxy"), Path("C:/Program Files/mitmp
 
 CORE_FILES = [
     "book.py", "capture_token.py", "token_capture_addon.py", "token_util.py",
-    "configure.py", "setup.py", "setup.bat", "requirements.txt",
+    "configure.py", "setup.py", "setup.bat", "requirements.txt", "requirements-gui.txt",
+    "gui.py", "gui_start.py", "certificate_manager.py",
 ]
 CONFIG_FILES = ["config/config.yaml.template", "config/config.schema.yaml"]
 SCRIPT_FILES = ["scripts/install_task.ps1", "scripts/setup_proxy.ps1",

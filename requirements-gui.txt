@@ -1,0 +1,3 @@
+# Windows x64 GUI portable build (Python 3.12).
+-r requirements.txt
+mitmproxy==11.0.2

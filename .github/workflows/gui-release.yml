@@ -1,0 +1,40 @@
+name: Windows GUI package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['gui-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install 3.12
+      - name: Install test dependencies
+        run: uv venv --python 3.12 .venv-gui
+      - run: uv pip install --python .venv-gui/Scripts/python.exe -r requirements-gui.txt pytest plyer
+      - name: Isolated onboarding tests
+        run: .venv-gui/Scripts/python.exe -m pytest tests/test_gui.py tests/test_certificate_manager.py tests/test_token_util.py tests/test_gui_build.py -q
+      - name: Build full portable GUI package
+        run: uv run --no-project --python 3.12 python scripts/build_gui.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: badminton-gui-windows-x64
+          path: |
+            dist-gui/*.zip
+            dist-gui/*.sha256
+      - name: Attach package to GUI release
+        if: startsWith(github.ref, 'refs/tags/gui-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem dist-gui -File | Where-Object { $_.Extension -in '.zip', '.sha256' } | ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME @assets --draft --title $env:GITHUB_REF_NAME --notes "Windows GUI portable package. Extract the complete ZIP and open the GUI launcher."

@@ -13,6 +13,7 @@ token 读取/校验/保存的共享模块（纯 stdlib）。
 
 import base64
 import json
+import math
 import os
 import tempfile
 import time
@@ -66,7 +67,7 @@ def jwt_exp(token):
     if not data:
         return None
     exp = data.get("exp")
-    if not isinstance(exp, (int, float)):
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
         return None
     return int(exp)
 
@@ -132,6 +133,33 @@ def read_cached_token(early_seconds=300):
     if not token_is_valid(tok, early_seconds):
         return ""
     return tok
+
+
+def cached_token_status(expected_student_id="", now=None):
+    """只检查本地 JWT 到期时间和账号；不验证签名或服务器登录状态，不返回 token。"""
+    result = {"state": "missing", "expires_at": None, "remaining_seconds": 0,
+              "student_id": None}
+    try:
+        raw = TOKEN_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return result
+    except (OSError, UnicodeError):
+        return {**result, "state": "unreadable"}
+    try:
+        data = json.loads(raw)
+        tok = normalize_token(data.get("token", "")) if isinstance(data, dict) else ""
+    except ValueError:
+        tok = _extract_token_from_text(raw)
+    exp = jwt_exp(tok)
+    if exp is None:
+        return {**result, "state": "invalid"}
+    remaining = exp - (time.time() if now is None else now)
+    sid = token_student_id(tok)
+    state = "expired" if remaining <= 0 else "expiring" if remaining <= 300 else "valid"
+    if remaining > 0 and expected_student_id and sid != str(expected_student_id):
+        state = "wrong_account"
+    return {"state": state, "expires_at": exp,
+            "remaining_seconds": max(0, int(remaining)), "student_id": sid}
 
 
 def _extract_token_from_text(raw_text):

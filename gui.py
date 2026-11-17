@@ -12,7 +12,10 @@
 """
 
 import sys
+import copy
+import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
@@ -20,8 +23,10 @@ from datetime import datetime
 import yaml
 
 import token_util
+from capture_token import CaptureError
+import certificate_manager
 from book import pre_fetch_type_id, query_slots
-from configure import render_config, CONFIG_PATH
+from configure import CONFIG_PATH
 
 
 LOCATIONS = [("仙林", "仙林"), ("三牌楼", "三牌楼"), ("不限", "")]
@@ -40,23 +45,59 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("南邮羽毛球预约配置")
-        root.geometry("900x580")
+        width = min(1060, root.winfo_screenwidth() - 80)
+        height = min(760, root.winfo_screenheight() - 100)
+        root.geometry(f"{width}x{height}+30+30")
+        root.minsize(min(900, width), min(600, height))
 
         self.cfg = load_config() or {}
         self.slots = []        # [(sid, name, start, end, status, date), ...]
         self.selected = []     # [(sid, name, start, end), ...] 按优先级
         self.loc = tk.StringVar(value="仙林")
         self._loading = False
+        self._capturing = False
+        self._closing = False
+        self._cert_busy = False
+        self._cert_info = None
+        self._cert_trusted = False
+        self._capture_stop = threading.Event()
+        self._events = queue.Queue()
+        self._last_token_check = 0
+        root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build_ui()
         self._apply_cfg_location()
         self._apply_cfg_targets()
+        self.check_token()
+        self.check_certificate()
+        self.root.after(100, self._poll_events)
         self.root.after(100, self.refresh_slots)
 
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
     def _build_ui(self):
+        onboarding = ttk.LabelFrame(self.root, text="首次使用：1 保存学号 → 2 检查并安装证书 → 3 获取登录", padding=8)
+        onboarding.pack(fill="x", padx=8, pady=8)
+        account = ttk.Frame(onboarding)
+        account.pack(fill="x")
+        ttk.Label(account, text="学号：").pack(side="left")
+        self.student_id = tk.StringVar(value=str((self.cfg.get("auth") or {}).get("student_id") or ""))
+        self.student_entry = ttk.Entry(account, textvariable=self.student_id, width=24)
+        self.student_entry.pack(side="left")
+        self.account_button = ttk.Button(account, text="保存学号", command=self.save_student_id)
+        self.account_button.pack(side="left", padx=6)
+        certrow = ttk.Frame(onboarding)
+        certrow.pack(fill="x", pady=6)
+        self.cert_check_button = ttk.Button(certrow, text="检查 / 准备证书", command=lambda: self.check_certificate(prepare=True))
+        self.cert_check_button.pack(side="left")
+        self.cert_install_button = ttk.Button(certrow, text="审查并安装证书", command=self.review_certificate, state="disabled")
+        self.cert_install_button.pack(side="left", padx=6)
+        self.cert_label = ttk.Label(certrow, text="尚未检查证书", wraplength=560)
+        self.cert_label.pack(side="left")
+        ttk.Label(onboarding, text="获取登录时：在电脑微信打开南邮小程序 → 进入场地页。成功、取消或超时后恢复原代理设置。",
+                  wraplength=980).pack(anchor="w")
+
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill="x")
 
@@ -69,6 +110,16 @@ class App:
 
         self.student_label = ttk.Label(top, text="")
         self.student_label.pack(side="right")
+
+        login = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        login.pack(fill="x")
+        self.capture_button = ttk.Button(login, text="获取 / 刷新登录", command=self.capture_token)
+        self.capture_button.pack(side="left")
+        ttk.Button(login, text="检测登录状态", command=self.check_token).pack(side="left", padx=6)
+        self.cancel_button = ttk.Button(login, text="取消获取", command=self._capture_stop.set, state="disabled")
+        self.cancel_button.pack(side="left")
+        self.token_label = ttk.Label(login, text="", wraplength=470)
+        self.token_label.pack(side="left", padx=8)
 
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         body.pack(fill="both", expand=True)
@@ -118,11 +169,197 @@ class App:
         # 底部
         bottom = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         bottom.pack(fill="x")
-        self.status = ttk.Label(bottom, text="加载中...", foreground="blue")
+        self.status = ttk.Label(bottom, text="加载中...", foreground="blue", wraplength=500)
         self.status.pack(side="left")
         ttk.Button(bottom, text="保存配置", command=self.save_config).pack(side="right", padx=4)
         ttk.Button(bottom, text="刷新", command=self.refresh_slots).pack(side="right", padx=4)
-        ttk.Button(bottom, text="退出", command=self.root.destroy).pack(side="right", padx=4)
+        ttk.Button(bottom, text="退出", command=self.close).pack(side="right", padx=4)
+
+    def save_student_id(self):
+        if self._capturing or self._loading or self._cert_busy:
+            self._set_status("请等待当前操作结束后再修改学号", "blue")
+            return False
+        sid = self.student_id.get().strip()
+        if not sid or not sid.isascii() or not sid.isalnum():
+            self._set_status("请输入只包含英文字母和数字的学号", "red")
+            return False
+        cfg = copy.deepcopy(self.cfg)
+        cfg.setdefault("auth", {})["student_id"] = sid
+        cfg.setdefault("booking", {}).setdefault("targets", [])
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Preserve all other fields, including settings created by older releases.
+            CONFIG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        except OSError:
+            self._set_status("学号保存失败，请把安装包解压到有写入权限的文件夹", "red")
+            return False
+        self.cfg = cfg
+        self.student_id.set(sid)
+        self._student_display()
+        self.check_token()
+        self._set_status("学号已保存；下一步检查证书，再获取登录", "green")
+        return True
+
+    def check_certificate(self, prepare=False):
+        if self._cert_busy or self._capturing or self._closing:
+            return
+        self._start_certificate_job("prepare" if prepare else "check")
+
+    def _start_certificate_job(self, action, fingerprint=None):
+        self._cert_busy = True
+        self.cert_check_button.config(state="disabled")
+        self.cert_install_button.config(state="disabled")
+        self.cert_label.config(text="正在处理证书，请稍候…")
+        threading.Thread(target=self._certificate_worker, args=(action, fingerprint), daemon=False).start()
+
+    def _certificate_worker(self, action, fingerprint):
+        try:
+            message = ""
+            if action == "install":
+                _ok, message = certificate_manager.install_reviewed_certificate(fingerprint)
+            info = (certificate_manager.prepare_certificate() if action == "prepare"
+                    else certificate_manager.inspect_certificate())
+            trusted = certificate_manager.is_trusted(info) if info else False
+            self._events.put(("certificate", (info, trusted, message)))
+        except Exception as exc:
+            self._events.put(("certificate_error", type(exc).__name__))
+
+    def review_certificate(self):
+        if self._cert_busy or self._capturing or not self._cert_info or self._closing:
+            return
+        info = self._cert_info
+        detail = ("此根证书用于本机代理解密南邮小程序的 HTTPS 流量以获取登录凭证。\n"
+                  "安装会将它加入当前 Windows 用户的受信任根证书库；拥有对应私钥的代理可以解密经它转发的 HTTPS 流量。\n"
+                  "本程序仅拦截 wechat.njupt.edu.cn；请妥善保管 ~/.mitmproxy 下的私钥。\n\n"
+                  f"主体：{info['subject']}\n颁发者：{info['issuer']}\n"
+                  f"有效期：{info['not_before']} 至 {info['not_after']}\n"
+                  f"SHA-256：{info['sha256']}\n文件：{info['path']}\n\n"
+                  "确认安装此证书？如 Windows 再次询问，请核对后确认。")
+        if messagebox.askyesno("审查根证书并确认安装", detail, parent=self.root):
+            self._start_certificate_job("install", info["sha256"])
+
+    def check_token(self):
+        """检测本地缓存，不发送网络请求。"""
+        sid = (self.cfg.get("auth") or {}).get("student_id", "")
+        info = token_util.cached_token_status(sid)
+        state = info["state"]
+        messages = {"missing": "未获取登录，请点击“获取 / 刷新登录”",
+                    "unreadable": "无法读取登录缓存，请检查文件权限",
+                    "invalid": "登录缓存无效，请重新获取",
+                    "expired": "登录已过期，请重新获取",
+                    "wrong_account": "登录账号与配置学号不一致，请重新获取"}
+        if state in ("valid", "expiring"):
+            seconds = info["remaining_seconds"]
+            try:
+                expiry = datetime.fromtimestamp(info["expires_at"]).strftime("%m-%d %H:%M:%S")
+                text = f"{'即将过期' if state == 'expiring' else '本地未过期'} · 剩余 {seconds // 60}分{seconds % 60}秒 · 到期 {expiry}（未验证服务器）"
+            except (ValueError, OSError, OverflowError):
+                text = "登录到期时间异常，请重新获取"
+        else:
+            text = messages[state]
+        self.token_label.config(text=text, foreground="green" if state == "valid" else "darkorange" if state == "expiring" else "red")
+        self._last_token_check = time.monotonic()
+        return info
+
+    def capture_token(self):
+        if self._capturing or self._closing or self._cert_busy:
+            return
+        if self._loading:
+            self._set_status("请等待场次查询结束后再获取登录", "blue")
+            return
+        if not (self.cfg.get("auth") or {}).get("student_id") or self.student_id.get().strip() != str(self.cfg["auth"]["student_id"]):
+            self._set_status("请先输入并保存学号", "red")
+            return
+        if not self._cert_trusted:
+            self._set_status("请先检查证书，并审查安装尚未受信任的证书", "red")
+            return
+        import capture_token
+        if not capture_token.find_mitmdump():
+            self._set_status("缺少抓包组件，请使用完整 GUI 绿色包；源码运行需安装 mitmproxy", "red")
+            return
+        self._capturing = True
+        self._capture_stop.clear()
+        self.capture_button.config(state="disabled")
+        self.cancel_button.config(state="normal")
+        self.account_button.config(state="disabled")
+        self.student_entry.config(state="disabled")
+        self._set_status("正在获取登录：请在电脑微信打开南邮小程序 → 场地页；最多等待 300 秒", "blue")
+        threading.Thread(target=self._capture_worker, daemon=False).start()
+
+    def _capture_worker(self):
+        try:
+            from capture_token import run_refresh
+            code = run_refresh(self.cfg, 300, force=True, stop_event=self._capture_stop)
+            self._events.put(("capture_done", code))
+        except CaptureError as exc:
+            self._events.put(("capture_error", str(exc)))
+        except Exception as exc:
+            # 异常类型足以定位失败；不把可能含 token 的异常正文展示在窗口中。
+            self._events.put(("capture_error", type(exc).__name__))
+
+    def _poll_events(self):
+        try:
+            while True:
+                kind, value = self._events.get_nowait()
+                if kind in ("capture_done", "capture_error"):
+                    self._capturing = False
+                    self.capture_button.config(state="normal")
+                    self.cancel_button.config(state="disabled")
+                    self.account_button.config(state="normal")
+                    self.student_entry.config(state="normal")
+                    info = self.check_token()
+                    self._student_display()
+                    if kind == "capture_error":
+                        self._set_status(f"获取登录失败（{value}）；请检查证书、抓包组件与 app/data/mitmdump.log", "red")
+                    elif value == 130:
+                        self._set_status("已取消获取登录，代理清理流程已结束", "blue")
+                    elif value == 0 and info["state"] == "valid":
+                        self._set_status("登录已获取，正在刷新场次", "green")
+                        if not self._closing:
+                            self.refresh_slots()
+                    else:
+                        self._set_status("未获取到可用的新登录，请重试；必要时重启电脑微信", "red")
+                elif kind == "slots":
+                    slots, date, location = value
+                    if location == self.loc.get():
+                        self._apply_slots(slots, date)
+                    else:
+                        self._finalize_load()
+                        self.refresh_slots()
+                elif kind == "load_error":
+                    self._finalize_load()
+                    self._set_status(value, "red")
+                elif kind in ("certificate", "certificate_error"):
+                    self._cert_busy = False
+                    self.cert_check_button.config(state="normal")
+                    self._cert_info = None
+                    self._cert_trusted = False
+                    if kind == "certificate_error":
+                        self.cert_label.config(text=f"证书检查失败（{value}），请使用完整 GUI 包后重试", foreground="red")
+                    else:
+                        self._cert_info, self._cert_trusted, message = value
+                        label = ("此证书已受 Windows 信任" if self._cert_trusted else
+                                 "证书已准备，请点击“审查并安装证书”" if self._cert_info else
+                                 "未找到证书，请点击“检查 / 准备证书”")
+                        self.cert_label.config(text=message or label,
+                                               foreground="green" if self._cert_trusted else "darkorange")
+                        self.cert_install_button.config(state="normal" if self._cert_info else "disabled")
+        except queue.Empty:
+            pass
+        if self._closing and not self._capturing and not self._cert_busy:
+            self.root.destroy()
+            return
+        if time.monotonic() - self._last_token_check >= 30:
+            self.check_token()
+        self.root.after(100, self._poll_events)
+
+    def close(self):
+        if self._capturing or self._cert_busy:
+            self._closing = True
+            self._capture_stop.set()
+            self._set_status("正在结束后台操作并恢复代理，请稍候…", "blue")
+            return
+        self.root.destroy()
 
     # ------------------------------------------------------------------
     # 配置加载
@@ -132,12 +369,16 @@ class App:
         self.loc.set(loc if loc else "")
 
     def _apply_cfg_targets(self):
-        """把已有 config 中的 targets 恢复为选中状态（仅加载当天能匹配到的）。"""
+        """加载已保存目标；当天查不到的场次也保留，避免刷新登录时丢失选择。"""
         targets = (self.cfg.get("booking") or {}).get("targets") or []
         self._cfg_targets = []
         for t in targets:
             if isinstance(t, dict):
                 self._cfg_targets.append((t.get("court_name", ""), t.get("time", "")))
+                period = t.get("time", "").split("-")
+                if len(period) == 2:
+                    self.selected.append(("", t.get("court_name", ""), *period))
+        self._refresh_listbox()
         self._student_display()
 
     def _student_display(self):
@@ -156,7 +397,7 @@ class App:
         self.refresh_slots()
 
     def refresh_slots(self):
-        if self._loading:
+        if self._loading or self._capturing or self._closing:
             return
         self._loading = True
         self._set_status("加载场次中...", "blue")
@@ -165,24 +406,27 @@ class App:
 
     def _load_worker(self, location):
         try:
+            sid = (self.cfg.get("auth") or {}).get("student_id", "")
+            if not sid:
+                self._events.put(("load_error", "请先输入并保存学号，再获取 / 刷新登录"))
+                return
+            if token_util.cached_token_status(sid)["state"] == "wrong_account":
+                self._events.put(("load_error", "登录账号与学号不一致，请获取 / 刷新登录"))
+                return
             token = token_util.read_cached_token()
             if not token:
-                self.root.after(0, lambda: self._set_status(
-                    "无有效 token，请先运行: python capture_token.py --wait 300", "red"))
-                self.root.after(0, self._finalize_load)
+                self._events.put(("load_error", "无有效登录，请点击顶部“获取 / 刷新登录”"))
                 return
             type_id = pre_fetch_type_id(token)
             if not type_id:
-                self.root.after(0, lambda: self._set_status("未找到羽毛球类型，token 可能已失效", "red"))
-                self.root.after(0, self._finalize_load)
+                self._events.put(("load_error", "未找到羽毛球类型，登录可能已失效，请重新获取"))
                 return
             date = datetime.now().strftime("%Y-%m-%d")
             slots = query_slots(token, date, type_id)
             filtered = [s for s in slots if not location or location in s[1]]
-            self.root.after(0, lambda: self._apply_slots(filtered, date))
+            self._events.put(("slots", (filtered, date, location)))
         except Exception as e:
-            self.root.after(0, lambda: self._set_status(f"加载失败: {e}", "red"))
-            self.root.after(0, self._finalize_load)
+            self._events.put(("load_error", f"场次查询失败（{type(e).__name__}），请检查网络或重新获取登录"))
 
     def _finalize_load(self):
         self._loading = False
@@ -215,15 +459,12 @@ class App:
                 )
 
     def _restore_selected_from_cfg(self):
-        """把 config 中已有的目标映射回当天场次并恢复选中。"""
-        self.selected = []
+        """更新已选目标的场次 ID，保留当前编辑内容和顺序。"""
         by_key = {}
         for idx, (_sid, name, start, end, status, _date) in enumerate(self.slots):
             by_key[(name, f"{start}-{end}")] = (_sid, name, start, end)
-        for name, time_ in self._cfg_targets:
-            entry = by_key.get((name, time_))
-            if entry and entry not in self.selected:
-                self.selected.append(entry)
+        self.selected = [by_key.get((name, f"{start}-{end}"), (sid, name, start, end))
+                         for sid, name, start, end in self.selected]
         self._refresh_listbox()
 
     # ------------------------------------------------------------------
@@ -254,7 +495,7 @@ class App:
         if not status:
             self._set_status(f"「{name} {start}-{end}」已满，无法加入", "red")
             return
-        if slot[:4] in [s[:4] for s in self.selected]:
+        if slot[1:4] in [s[1:4] for s in self.selected]:
             self._set_status(f"「{name} {start}-{end}」已在目标中", "orange")
             return
         self.selected.append(slot[:4])
@@ -299,6 +540,9 @@ class App:
     # 保存
     # ------------------------------------------------------------------
     def save_config(self):
+        if self._capturing or self._cert_busy:
+            self._set_status("请等待当前操作结束后再保存配置", "blue")
+            return
         targets = [
             {"court_name": name, "time": f"{start}-{end}"}
             for (_sid, name, start, end) in self.selected
@@ -307,7 +551,8 @@ class App:
         booking["location"] = self.loc.get()
         booking["targets"] = targets
         try:
-            CONFIG_PATH.write_text(render_config(self.cfg), encoding="utf-8")
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(yaml.safe_dump(self.cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
             return
@@ -320,6 +565,12 @@ class App:
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except OSError:
+            pass
     try:
         root = tk.Tk()
     except tk.TclError as e:

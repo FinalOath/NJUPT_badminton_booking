@@ -20,6 +20,7 @@ mitmproxy addon：监听南邮小程序流量，自动提取并保存新 token�
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from token_util import (normalize_token, jwt_exp, token_student_id,
-                        save_token, current_best_exp, env_student_id)
+                        save_token, current_best_exp, env_student_id, read_cached_token)
 
 HOST = "wechat.njupt.edu.cn"
 LOGIN_PATHS = ("/login/wxLogin", "/login/wecomLogin")
@@ -76,7 +77,12 @@ def _consider(token, log=lambda msg: None):
     if not score:
         return
     with _lock:
-        if score <= current_best_exp():
+        previous = read_cached_token()
+        switching_account = bool(previous and token_student_id(previous) != token_student_id(token)
+                                 and env_student_id() == token_student_id(token))
+        force = os.environ.get("NJUPT_FORCE_TOKEN") == "1"
+        if not switching_account and (score < current_best_exp() or
+                                     (score == current_best_exp() and not force)):
             return  # 不比现有缓存更新，不覆盖
         norm = normalize_token(token)
         if norm == _last_written[0]:

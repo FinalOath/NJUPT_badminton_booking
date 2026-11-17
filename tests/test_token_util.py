@@ -55,6 +55,26 @@ class TestParse:
 
 
 class TestCache:
+    def test_status_distinguishes_missing_expired_expiring_and_account(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tu, "TOKEN_PATH", tmp_path / "session_cache.json")
+        assert tu.cached_token_status()["state"] == "missing"
+        tu.save_token(make_jwt({"exp": 2000, "studentId": "B1"}))
+        assert tu.cached_token_status(now=2000)["state"] == "expired"
+        assert tu.cached_token_status(now=1900)["state"] == "expiring"
+        info = tu.cached_token_status("B1", now=1000)
+        assert info["state"] == "valid"
+        assert info["remaining_seconds"] == 1000
+        assert "token" not in info
+        assert tu.cached_token_status("B2", now=1000)["state"] == "wrong_account"
+
+    def test_status_invalid_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tu, "TOKEN_PATH", tmp_path / "session_cache.json")
+        for raw in ('{}', '[]', 'null', 'broken', '{"token": 12}'):
+            tu.TOKEN_PATH.write_text(raw, encoding="utf-8")
+            assert tu.cached_token_status()["state"] == "invalid"
+        for exp in (True, float("inf"), float("nan")):
+            assert tu.jwt_exp(make_jwt({"exp": exp})) is None
+
     def test_save_read_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr(tu, "TOKEN_PATH", tmp_path / "session_cache.json")
         t = future_token()
