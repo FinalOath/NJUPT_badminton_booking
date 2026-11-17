@@ -1,5 +1,5 @@
 auth:
-  student_id: ''
+  student_id: ""
   cas_mode: wecom
 token_capture:
   enabled: true
